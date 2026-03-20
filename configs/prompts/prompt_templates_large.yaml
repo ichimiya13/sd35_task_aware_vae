@@ -1,0 +1,7 @@
+mode: neutral
+neutral_prompt: "ultra-widefield fundus photograph, high-fidelity clinical retinal imaging, medically faithful anatomy"
+negative_prompt: "cartoon, illustration, painting, text overlay, watermark, duplicated vessels, malformed optic disc"
+label_prompt_prefix: "ultra-widefield fundus photograph showing "
+label_prompt_suffix: ", clinically plausible retinal appearance"
+label_prompt_none: "no clearly visible retinal abnormality"
+label_separator: ", "

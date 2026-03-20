@@ -1,0 +1,18 @@
+model:
+  family: sd35
+  variant: medium
+  repo_id: stabilityai/stable-diffusion-3.5-medium
+  device: cuda
+  torch_dtype: bf16
+  enable_cpu_offload: false
+  enable_sequential_cpu_offload: false
+  enable_attention_slicing: false
+  allow_tf32: true
+  num_inference_steps: 40
+  guidance_scale: 4.5
+  max_sequence_length: 256
+  quantization:
+    enabled: false
+    subfolder: transformer
+    bnb_4bit_quant_type: nf4
+    compute_dtype: bf16

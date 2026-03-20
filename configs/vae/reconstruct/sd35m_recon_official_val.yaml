@@ -1,0 +1,40 @@
+experiment_name: sd35m_recon_official_val
+seed: 42
+
+data:
+  root: "../data/uwf/multilabel/MedicalCheckup/splitted"
+  split_filename: "default_split.yaml"
+  split: "val"
+  label_schema_file: "configs/labels/proposed_schema.yaml"
+
+image:
+  center_crop_size: 3072
+  image_size: 1024
+
+model:
+  family: sd35
+  variant: medium
+  repo_id: stabilityai/stable-diffusion-3.5-medium
+  device: cuda
+  torch_dtype: fp32
+
+vae:
+  backend: sd35
+  use_official: true
+  subfolder: vae
+  checkpoint: null
+  posterior: mode
+
+inference:
+  batch_size: 4
+  num_workers: 2
+
+noise:
+  mode: gaussian
+  timesteps: [0]
+
+output:
+  root_dir: outputs/reconstructions/sd35
+  copy_labels: true
+  preserve_relative_paths: true
+  keep_original_name_for_t0: true

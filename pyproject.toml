@@ -1,0 +1,29 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "sd35-task-aware-vae"
+version = "0.1.0"
+description = "SD3.5-based task-aware VAE research code for UWF retinal imaging"
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = [
+  "accelerate>=0.33.0",
+  "numpy>=1.24.0",
+  "Pillow>=10.0.0",
+  "pyyaml>=6.0",
+  "scikit-learn>=1.4.0",
+  "tqdm>=4.66.0",
+  "torch>=2.3.0",
+  "torchvision>=0.18.0",
+  "transformers>=4.44.0",
+  "diffusers>=0.31.0",
+  "sentencepiece>=0.2.0",
+]
+
+[tool.setuptools]
+package-dir = {"" = "."}
+
+[tool.setuptools.packages.find]
+include = ["src*"]

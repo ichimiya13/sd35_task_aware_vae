@@ -1,0 +1,50 @@
+from __future__ import annotations
+
+from typing import Any, Sequence
+
+from PIL import Image
+
+from src.sd35_task_aware_vae.sd3.prompts import resolve_prompts
+
+
+def _default_size(model_cfg: dict[str, Any]) -> tuple[int, int]:
+    image_cfg = model_cfg.get("image", {}) or {}
+    height = int(image_cfg.get("height", image_cfg.get("image_size", 1024)))
+    width = int(image_cfg.get("width", image_cfg.get("image_size", 1024)))
+    return height, width
+
+
+def sample_text2img(pipe, model_cfg: dict[str, Any], prompts: Sequence[str], negative_prompts: Sequence[str] | None = None):
+    height, width = _default_size(model_cfg)
+    output = pipe(
+        prompt=list(prompts),
+        negative_prompt=list(negative_prompts) if negative_prompts is not None else None,
+        num_inference_steps=int(model_cfg.get("num_inference_steps", 40)),
+        guidance_scale=float(model_cfg.get("guidance_scale", 4.5)),
+        height=height,
+        width=width,
+        output_type="pil",
+    )
+    return list(output.images)
+
+
+def sample_img2img(
+    pipe,
+    model_cfg: dict[str, Any],
+    images: Sequence[Image.Image],
+    prompts: Sequence[str],
+    negative_prompts: Sequence[str] | None = None,
+):
+    height, width = _default_size(model_cfg)
+    output = pipe(
+        prompt=list(prompts),
+        negative_prompt=list(negative_prompts) if negative_prompts is not None else None,
+        image=list(images),
+        num_inference_steps=int(model_cfg.get("num_inference_steps", 40)),
+        guidance_scale=float(model_cfg.get("guidance_scale", 4.5)),
+        strength=float(model_cfg.get("strength", 0.6)),
+        height=height,
+        width=width,
+        output_type="pil",
+    )
+    return list(output.images)
