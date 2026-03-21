@@ -34,7 +34,7 @@ prompts:
   mode: neutral
   neutral_prompt: "ultra-widefield fundus photograph, clinical retinal imaging, medically faithful"
   negative_prompt: "cartoon, illustration, painting, text overlay, watermark"
-  offload_static_text_encoders: true
+  offload_static_text_encoders: False
 
 vae:
   backend: sd35

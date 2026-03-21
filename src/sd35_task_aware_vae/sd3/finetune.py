@@ -201,34 +201,40 @@ def _load_state_dict_file(path: Path):
                 return state[key]
     return state
 
+def _resolve_transformer_source(model_cfg: dict[str, Any], transformer_cfg: dict[str, Any]) -> tuple[str, str]:
+    checkpoint = transformer_cfg.get("checkpoint", None)
+    if checkpoint:
+        return str(checkpoint), str(transformer_cfg.get("subfolder", ""))
 
+    repo_id = str(transformer_cfg.get("model_repo_id", model_cfg.get("repo_id")))
+    subfolder = str(transformer_cfg.get("subfolder", "transformer"))
+    return repo_id, subfolder
 
 def _build_sd3_transformer(model_cfg: dict[str, Any], transformer_cfg: dict[str, Any], torch_dtype):
-    ckpt = transformer_cfg.get("checkpoint", None)
-    if not ckpt:
-        return None
+    from pathlib import Path
+    from diffusers import SD3Transformer2DModel
 
-    try:
-        from diffusers import SD3Transformer2DModel
-    except Exception as e:  # pragma: no cover - optional dependency
-        raise RuntimeError("diffusers is required to load the SD3 transformer") from e
+    source, subfolder = _resolve_transformer_source(model_cfg, transformer_cfg)
+    source_path = Path(source)
 
-    source = Path(str(ckpt))
-    if source.is_file() and source.suffix.lower() in {".pt", ".pth", ".bin", ".safetensors"}:
+    if source_path.is_file() and source_path.suffix.lower() in {".pt", ".pth", ".bin", ".safetensors"}:
         base_repo = str(transformer_cfg.get("model_repo_id", model_cfg.get("repo_id")))
-        base_subfolder = str(transformer_cfg.get("base_subfolder", transformer_cfg.get("subfolder", "transformer")))
-        transformer = SD3Transformer2DModel.from_pretrained(base_repo, subfolder=base_subfolder, torch_dtype=torch_dtype)
-        state_dict = _load_state_dict_file(source)
+        base_subfolder = str(transformer_cfg.get("base_subfolder", "transformer"))
+        transformer = SD3Transformer2DModel.from_pretrained(
+            base_repo,
+            subfolder=base_subfolder,
+            torch_dtype=torch_dtype,
+        )
+        state_dict = _load_state_dict_file(source_path)
         missing, unexpected = transformer.load_state_dict(state_dict, strict=False)
         if missing or unexpected:
             print(f"[warn] transformer state_dict load: missing={len(missing)} unexpected={len(unexpected)}", flush=True)
         return transformer
 
-    load_kwargs: dict[str, Any] = {"torch_dtype": torch_dtype}
-    subfolder = str(transformer_cfg.get("subfolder", ""))
+    load_kwargs = {"torch_dtype": torch_dtype}
     if subfolder:
         load_kwargs["subfolder"] = subfolder
-    return SD3Transformer2DModel.from_pretrained(str(ckpt), **load_kwargs)
+    return SD3Transformer2DModel.from_pretrained(source, **load_kwargs)
 
 
 
@@ -380,6 +386,7 @@ def _compute_loss_weighting_fallback(weighting_scheme: str, sigmas: torch.Tensor
 
 
 
+"""
 def _ensure_scheduler_state(noise_scheduler, device: torch.device) -> None:
     if getattr(noise_scheduler, "timesteps", None) is not None and getattr(noise_scheduler, "sigmas", None) is not None:
         return
@@ -388,7 +395,29 @@ def _ensure_scheduler_state(noise_scheduler, device: torch.device) -> None:
         noise_scheduler.set_timesteps(num_train_timesteps, device=device)
     except TypeError:
         noise_scheduler.set_timesteps(num_train_timesteps)
+"""
 
+def _ensure_scheduler_state(noise_scheduler, device: torch.device) -> None:
+    has_t = getattr(noise_scheduler, "timesteps", None) is not None
+    has_s = getattr(noise_scheduler, "sigmas", None) is not None
+
+    if has_t and has_s:
+        try:
+            noise_scheduler.timesteps = noise_scheduler.timesteps.to(device)
+            noise_scheduler.sigmas = noise_scheduler.sigmas.to(device)
+        except Exception:
+            pass
+        return
+
+    num_train_timesteps = int(getattr(noise_scheduler.config, "num_train_timesteps", 1000))
+    try:
+        noise_scheduler.set_timesteps(num_train_timesteps, device=device)
+    except TypeError:
+        noise_scheduler.set_timesteps(num_train_timesteps)
+        if getattr(noise_scheduler, "timesteps", None) is not None:
+            noise_scheduler.timesteps = noise_scheduler.timesteps.to(device)
+        if getattr(noise_scheduler, "sigmas", None) is not None:
+            noise_scheduler.sigmas = noise_scheduler.sigmas.to(device)
 
 
 def _get_sigmas(noise_scheduler, timesteps: torch.Tensor, n_dim: int = 4, dtype=torch.float32, device: torch.device | None = None):
@@ -971,6 +1000,13 @@ def train_sd35_system_from_config(cfg: dict[str, Any], config_path: str | Path) 
 
     custom_transformer = _build_sd3_transformer(model_cfg, transformer_cfg, torch_dtype=load_dtype)
     custom_vae = build_sd3_vae(model_cfg, vae_cfg, torch_dtype=load_dtype, device=None)
+    
+    print("custom_transformer:", type(custom_transformer))
+    print("custom_vae:", type(custom_vae))
+    if custom_vae is None:
+        raise RuntimeError("build_sd3_vae returned None.")
+    if custom_transformer is None:
+        raise RuntimeError("_build_sd3_transformer returned None.")
 
     pipe = StableDiffusion3Pipeline.from_pretrained(
         str(model_cfg["repo_id"]),
@@ -978,6 +1014,10 @@ def train_sd35_system_from_config(cfg: dict[str, Any], config_path: str | Path) 
         vae=custom_vae,
         torch_dtype=load_dtype,
     )
+    
+    print("pipe.transformer:", type(pipe.transformer))
+    print("pipe.vae:", type(pipe.vae))
+    
     pipe.to(device)
 
     transformer = pipe.transformer
@@ -1037,7 +1077,7 @@ def train_sd35_system_from_config(cfg: dict[str, Any], config_path: str | Path) 
         class_names=class_names,
         device=device,
         max_sequence_length=int(model_cfg.get("max_sequence_length", prompt_cfg.get("max_sequence_length", 256))),
-        offload_static_text_encoders=bool(prompt_cfg.get("offload_static_text_encoders", True)),
+        offload_static_text_encoders=bool(prompt_cfg.get("offload_static_text_encoders", False)),
     )
 
     teacher = build_teacher_if_needed(
