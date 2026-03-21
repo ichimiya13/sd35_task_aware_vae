@@ -15,6 +15,7 @@ from src.sd35_task_aware_vae.sd3.prompts import resolve_prompts
 from src.sd35_task_aware_vae.sd3.sampling import sample_img2img, sample_text2img
 from src.sd35_task_aware_vae.teacher_classifier import build_convnext_large, build_teacher_transforms
 from src.sd35_task_aware_vae.utils.config import dump_yaml
+from src.sd35_task_aware_vae.utils.device import get_gpu_ids, set_visible_gpus
 from src.sd35_task_aware_vae.utils.files import ensure_dir, write_csv, write_json
 from src.sd35_task_aware_vae.utils.seed import seed_everything
 
@@ -78,6 +79,8 @@ def main() -> None:
     args = parser.parse_args()
 
     cfg = load_yaml(args.config)
+    gpu_ids = get_gpu_ids(cfg)
+    set_visible_gpus(gpu_ids)
     seed_everything(int(cfg.get("seed", 42)), deterministic=bool(cfg.get("deterministic", False)))
 
     import torch
@@ -88,6 +91,7 @@ def main() -> None:
     model_cfg = cfg.get("model", {}) or {}
     vae_cfg = cfg.get("vae", {}) or {}
     prompt_cfg = cfg.get("prompt", cfg.get("prompts", {})) or {}
+    transformer_cfg = cfg.get("transformer", {}) or {}
     gen_cfg = cfg.get("generation", {}) or {}
     filter_cfg = cfg.get("filter", {}) or {}
     out_cfg = cfg.get("output", {}) or {}
@@ -176,9 +180,9 @@ def main() -> None:
 
     mode = str(gen_cfg.get("mode", "img2img")).lower()
     if mode == "text2img":
-        pipe = build_sd3_text2img_pipeline(model_cfg, vae_cfg)
+        pipe = build_sd3_text2img_pipeline(model_cfg, vae_cfg, transformer_cfg)
     elif mode == "img2img":
-        pipe = build_sd3_img2img_pipeline(model_cfg, vae_cfg)
+        pipe = build_sd3_img2img_pipeline(model_cfg, vae_cfg, transformer_cfg)
     else:
         raise ValueError(f"Unsupported generation.mode: {mode}")
 

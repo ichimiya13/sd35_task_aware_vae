@@ -15,6 +15,7 @@ from src.sd35_task_aware_vae.sd3.pipeline_factory import build_sd3_img2img_pipel
 from src.sd35_task_aware_vae.sd3.restore import reverse_restore_batch
 from src.sd35_task_aware_vae.teacher_classifier import build_convnext_large, build_teacher_transforms
 from src.sd35_task_aware_vae.utils.config import dump_yaml
+from src.sd35_task_aware_vae.utils.device import get_gpu_ids, set_visible_gpus
 from src.sd35_task_aware_vae.utils.files import ensure_dir, write_csv, write_json
 from src.sd35_task_aware_vae.utils.seed import seed_everything
 
@@ -108,6 +109,8 @@ def main() -> None:
     args = parser.parse_args()
 
     cfg = load_yaml(args.config)
+    gpu_ids = get_gpu_ids(cfg)
+    set_visible_gpus(gpu_ids)
     seed_everything(int(cfg.get("seed", 42)), deterministic=bool(cfg.get("deterministic", False)))
 
     import torch
@@ -119,6 +122,7 @@ def main() -> None:
     vae_cfg = cfg.get("vae", {}) or {}
     eval_cfg = cfg.get("eval", {}) or {}
     prompt_cfg = cfg.get("prompt", cfg.get("prompts", {})) or {}
+    transformer_cfg = cfg.get("transformer", {}) or {}
     out_cfg = cfg.get("output", {}) or {}
 
     out_root = ensure_dir(out_cfg.get("root_dir", "outputs/eval/sd3_restore"))
@@ -213,7 +217,7 @@ def main() -> None:
     use_embedding_cos = bool((eval_cfg.get("agreement", {}) or {}).get("embedding_cosine", False))
 
     print("[info] building SD3.5 img2img pipeline...")
-    pipe = build_sd3_img2img_pipeline(model_cfg, vae_cfg)
+    pipe = build_sd3_img2img_pipeline(model_cfg, vae_cfg, transformer_cfg)
     if hasattr(pipe, "scheduler") and eval_cfg.get("scheduler", None):
         # Future extension point; currently we use the pipeline's default scheduler.
         pass
