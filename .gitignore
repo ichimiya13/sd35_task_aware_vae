@@ -18,4 +18,4 @@ build/
 
 outputs/
 src/scripts/dataset_stats.py
-/configs/wandb_api_key.txt
+configs/wandb_api_key.txt

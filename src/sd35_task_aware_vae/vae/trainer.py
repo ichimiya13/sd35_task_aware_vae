@@ -5,8 +5,6 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
-import numpy as np
-
 from src.sd35_task_aware_vae.datasets.image_dataset import MultiLabelMedicalDataset
 from src.sd35_task_aware_vae.labels.schema import load_label_schema
 from src.sd35_task_aware_vae.sd3.latent_codec import decode_from_latents, encode_to_latents
@@ -14,7 +12,8 @@ from src.sd35_task_aware_vae.sd3.vae_factory import apply_freeze_patterns, build
 from src.sd35_task_aware_vae.teacher_classifier import build_convnext_large
 from src.sd35_task_aware_vae.utils.config import dump_yaml
 from src.sd35_task_aware_vae.utils.files import ensure_dir, write_csv, write_json
-from src.sd35_task_aware_vae.utils.seed import build_generator, seed_everything
+from src.sd35_task_aware_vae.utils.seed import seed_everything
+from src.sd35_task_aware_vae.utils.wandb import init_wandb_session, maybe_build_wandb_image
 from src.sd35_task_aware_vae.vae.losses import feature_distance, posterior_kl_loss, reconstruction_loss
 
 
@@ -324,6 +323,9 @@ def _run_epoch(
     grad_accum_steps: int,
     epoch: int,
     save_preview_dir: Path | None = None,
+    global_step_start: int = 0,
+    wandb_session=None,
+    step_log_interval: int = 0,
 ):
     import torch
     from torchvision.utils import save_image
@@ -331,12 +333,43 @@ def _run_epoch(
     vae.train(train)
     total = recon = kl = feat = logit = noise_feat = 0.0
     num_batches = 0
+    optimizer_step = int(global_step_start)
 
     autocast_enabled = amp_dtype is not None and device.type == "cuda"
     preview_saved = False
 
     if train:
         optimizer.zero_grad(set_to_none=True)
+
+    def _maybe_log_step(terms, step_idx: int):
+        if (not train) or wandb_session is None or (not getattr(wandb_session, "enabled", False)):
+            return
+        if step_log_interval <= 0 or step_idx % max(1, step_log_interval) != 0:
+            return
+        lr_now = float(optimizer.param_groups[0]["lr"])
+        payload = {
+            "train/global_step": step_idx,
+            "train/epoch": epoch,
+            "train/loss_step": float(terms["total"].detach().cpu()),
+            "train/recon_step": float(terms["recon"].detach().cpu()),
+            "train/kl_step": float(terms["kl"].detach().cpu()),
+            "train/feature_step": float(terms["feature"].detach().cpu()),
+            "train/logit_step": float(terms["logit"].detach().cpu()),
+            "train/noise_feature_step": float(terms["noise_feature"].detach().cpu()),
+            "train/loss_running": float(total / max(1, num_batches)),
+            "train/recon_running": float(recon / max(1, num_batches)),
+            "train/kl_running": float(kl / max(1, num_batches)),
+            "train/feature_running": float(feat / max(1, num_batches)),
+            "train/logit_running": float(logit / max(1, num_batches)),
+            "train/noise_feature_running": float(noise_feat / max(1, num_batches)),
+            "train/lr": lr_now,
+        }
+        try:
+            if scaler is not None:
+                payload["train/grad_scale"] = float(scaler.get_scale())
+        except Exception:
+            pass
+        wandb_session.log(payload, step=step_idx)
 
     for step, (images, _labels, _paths) in enumerate(loader):
         images = images.to(device=device, dtype=torch.float32)
@@ -368,6 +401,7 @@ def _run_epoch(
                     else:
                         optimizer.step()
                     optimizer.zero_grad(set_to_none=True)
+                    optimizer_step += 1
 
         total += float(terms["total"].detach().cpu())
         recon += float(terms["recon"].detach().cpu())
@@ -376,6 +410,9 @@ def _run_epoch(
         logit += float(terms["logit"].detach().cpu())
         noise_feat += float(terms["noise_feature"].detach().cpu())
         num_batches += 1
+
+        if train and (step + 1) % max(1, grad_accum_steps) == 0:
+            _maybe_log_step(terms, optimizer_step)
 
         if save_preview_dir is not None and not preview_saved:
             preview_saved = True
@@ -392,9 +429,11 @@ def _run_epoch(
         else:
             optimizer.step()
         optimizer.zero_grad(set_to_none=True)
+        optimizer_step += 1
+        _maybe_log_step(terms, optimizer_step)
 
     denom = float(max(1, num_batches))
-    return EpochSummary(
+    summary = EpochSummary(
         epoch=epoch,
         split="train" if train else "val",
         total_loss=total / denom,
@@ -404,6 +443,7 @@ def _run_epoch(
         logit_loss=logit / denom,
         noise_feature_loss=noise_feat / denom,
     )
+    return summary, optimizer_step
 
 
 
@@ -504,40 +544,35 @@ def train_sd35_vae_from_config(cfg: dict[str, Any], config_path: str | Path) -> 
     if not (amp_dtype == torch.float16 and device.type == "cuda"):
         scaler = None
 
+    wandb_session = init_wandb_session(
+        cfg,
+        out_dir=out_dir,
+        experiment_name=exp_name,
+        default_project="sd35-vae-train",
+        enabled=True,
+    )
+    wandb_session.set_summary("num_classes", num_classes)
+    wandb_session.set_summary("num_train_samples", len(train_ds))
+    wandb_session.set_summary("num_val_samples", len(val_ds))
+    wandb_session.set_summary("trainable_params", int(sum(p.numel() for p in trainable)))
+
     history_rows: list[dict[str, Any]] = []
     best_val = math.inf
     best_epoch = -1
     epochs = int(train_cfg.get("epochs", 10))
+    global_step = 0
+    step_log_interval = int((cfg.get("wandb", {}) or {}).get("log_interval_steps", 0))
 
-    for epoch in range(1, epochs + 1):
-        train_summary = _run_epoch(
-            vae=vae,
-            loader=train_loader,
-            optimizer=optimizer,
-            scaler=scaler,
-            device=device,
-            amp_dtype=amp_dtype,
-            train=True,
-            teacher=teacher,
-            mean=mean,
-            std=std,
-            loss_cfg=loss_cfg,
-            teacher_cfg=teacher_cfg,
-            posterior_mode=posterior_mode,
-            noise_cfg=noise_cfg,
-            grad_accum_steps=grad_accum_steps,
-            epoch=epoch,
-            save_preview_dir=(out_dir / "previews") if bool(train_cfg.get("save_previews", True)) else None,
-        )
-        with torch.no_grad():
-            val_summary = _run_epoch(
+    try:
+        for epoch in range(1, epochs + 1):
+            train_summary, global_step = _run_epoch(
                 vae=vae,
-                loader=val_loader,
+                loader=train_loader,
                 optimizer=optimizer,
                 scaler=scaler,
                 device=device,
                 amp_dtype=amp_dtype,
-                train=False,
+                train=True,
                 teacher=teacher,
                 mean=mean,
                 std=std,
@@ -547,41 +582,91 @@ def train_sd35_vae_from_config(cfg: dict[str, Any], config_path: str | Path) -> 
                 noise_cfg=noise_cfg,
                 grad_accum_steps=grad_accum_steps,
                 epoch=epoch,
+                save_preview_dir=(out_dir / "previews") if bool(train_cfg.get("save_previews", True)) else None,
+                global_step_start=global_step,
+                wandb_session=wandb_session,
+                step_log_interval=step_log_interval,
             )
+            with torch.no_grad():
+                val_summary, _ = _run_epoch(
+                    vae=vae,
+                    loader=val_loader,
+                    optimizer=optimizer,
+                    scaler=scaler,
+                    device=device,
+                    amp_dtype=amp_dtype,
+                    train=False,
+                    teacher=teacher,
+                    mean=mean,
+                    std=std,
+                    loss_cfg=loss_cfg,
+                    teacher_cfg=teacher_cfg,
+                    posterior_mode=posterior_mode,
+                    noise_cfg=noise_cfg,
+                    grad_accum_steps=grad_accum_steps,
+                    epoch=epoch,
+                    global_step_start=global_step,
+                )
 
-        history_rows.extend([train_summary.as_row(), val_summary.as_row()])
-        write_csv(history_rows, out_dir / "history.csv")
+            history_rows.extend([train_summary.as_row(), val_summary.as_row()])
+            write_csv(history_rows, out_dir / "history.csv")
 
-        vae.save_pretrained(out_dir / "last" / "vae")
-        torch.save(
-            {
-                "epoch": epoch,
-                "optimizer": optimizer.state_dict(),
-                "scheduler": scheduler.state_dict() if scheduler is not None else None,
-                "history": history_rows,
-            },
-            out_dir / "last" / "train_state.pt",
-        )
-
-        if val_summary.total_loss < best_val:
-            best_val = val_summary.total_loss
-            best_epoch = epoch
-            vae.save_pretrained(out_dir / "best" / "vae")
-            write_json(
+            vae.save_pretrained(out_dir / "last" / "vae")
+            torch.save(
                 {
-                    "best_epoch": best_epoch,
-                    "best_val_total_loss": best_val,
-                    "train_summary": train_summary.as_row(),
-                    "val_summary": val_summary.as_row(),
+                    "epoch": epoch,
+                    "global_step": global_step,
+                    "optimizer": optimizer.state_dict(),
+                    "scheduler": scheduler.state_dict() if scheduler is not None else None,
+                    "history": history_rows,
                 },
-                out_dir / "best" / "metrics.json",
+                out_dir / "last" / "train_state.pt",
             )
 
-        if scheduler is not None:
-            scheduler.step()
+            preview_path = out_dir / "previews" / f"epoch_{epoch:03d}.png"
+            epoch_payload = {
+                "epoch": epoch,
+                "global_step": global_step,
+                "train/loss_epoch": train_summary.total_loss,
+                "train/recon_epoch": train_summary.recon_loss,
+                "train/kl_epoch": train_summary.kl_loss,
+                "train/feature_epoch": train_summary.feature_loss,
+                "train/logit_epoch": train_summary.logit_loss,
+                "train/noise_feature_epoch": train_summary.noise_feature_loss,
+                "val/loss": val_summary.total_loss,
+                "val/recon": val_summary.recon_loss,
+                "val/kl": val_summary.kl_loss,
+                "val/feature": val_summary.feature_loss,
+                "val/logit": val_summary.logit_loss,
+                "val/noise_feature": val_summary.noise_feature_loss,
+                "train/lr": float(optimizer.param_groups[0]["lr"]),
+            }
+            if preview_path.is_file():
+                wb_img = maybe_build_wandb_image(wandb_session, str(preview_path), caption=f"epoch {epoch}")
+                if wb_img is not None:
+                    epoch_payload["preview/recon"] = wb_img
+            wandb_session.log(epoch_payload, step=global_step)
 
-    write_json(
-        {
+            if val_summary.total_loss < best_val:
+                best_val = val_summary.total_loss
+                best_epoch = epoch
+                vae.save_pretrained(out_dir / "best" / "vae")
+                write_json(
+                    {
+                        "best_epoch": best_epoch,
+                        "best_val_total_loss": best_val,
+                        "train_summary": train_summary.as_row(),
+                        "val_summary": val_summary.as_row(),
+                    },
+                    out_dir / "best" / "metrics.json",
+                )
+                wandb_session.set_summary("best_epoch", best_epoch)
+                wandb_session.set_summary("best_val_total_loss", best_val)
+
+            if scheduler is not None:
+                scheduler.step()
+
+        summary = {
             "experiment_name": exp_name,
             "num_classes": num_classes,
             "num_train_samples": len(train_ds),
@@ -590,7 +675,11 @@ def train_sd35_vae_from_config(cfg: dict[str, Any], config_path: str | Path) -> 
             "best_val_total_loss": best_val,
             "trainable_params": int(sum(p.numel() for p in trainable)),
             "total_params": int(sum(p.numel() for p in vae.parameters())),
-        },
-        out_dir / "summary.json",
-    )
-    return out_dir
+            "global_step": global_step,
+        }
+        write_json(summary, out_dir / "summary.json")
+        for key, value in summary.items():
+            wandb_session.set_summary(key, value)
+        return out_dir
+    finally:
+        wandb_session.finish()

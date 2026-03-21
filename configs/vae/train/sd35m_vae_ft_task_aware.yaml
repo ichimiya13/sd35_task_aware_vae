@@ -1,6 +1,9 @@
 experiment_name: sd35m_vae_ft_task_aware
 seed: 42
 
+runtime:
+  gpu_ids: [0]
+
 data:
   root: "../data/uwf/multilabel/MedicalCheckup/splitted"
   split_filename: "default_split.yaml"
@@ -66,3 +69,10 @@ noise_conditioning:
 
 output:
   root_dir: outputs/checkpoints/vae
+
+wandb:
+  enabled: true
+  project: uwf-sd35
+  name: sd35m_vae_ft_task_aware
+  mode: online
+  log_interval_steps: 10
