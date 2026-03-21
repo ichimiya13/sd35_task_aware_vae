@@ -48,7 +48,11 @@ def build_sd3_transformer(
     ckpt = transformer_cfg.get("checkpoint", None) or model_cfg.get("transformer_checkpoint", None)
     normalized = _normalize_transformer_source(ckpt)
     if not normalized:
-        return None
+        quant_cfg = (model_cfg.get("quantization", {}) or {})
+        if bool(quant_cfg.get("enabled", False)):
+            return None
+        normalized = str(transformer_cfg.get("model_repo_id", model_cfg.get("repo_id")))
+        transformer_cfg = {**transformer_cfg, "subfolder": str(transformer_cfg.get("subfolder", "transformer"))}
 
     try:
         from diffusers import SD3Transformer2DModel

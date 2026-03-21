@@ -5,6 +5,11 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
+try:
+    from tqdm.auto import tqdm
+except Exception:  # pragma: no cover - optional dependency
+    tqdm = None
+
 from src.sd35_task_aware_vae.datasets.image_dataset import MultiLabelMedicalDataset
 from src.sd35_task_aware_vae.labels.schema import load_label_schema
 from src.sd35_task_aware_vae.sd3.latent_codec import decode_from_latents, encode_to_latents
@@ -316,53 +321,67 @@ def _run_epoch(
     teacher,
     mean,
     std,
-    loss_cfg,
-    teacher_cfg,
-    posterior_mode,
-    noise_cfg,
+    loss_cfg: dict[str, Any],
+    teacher_cfg: dict[str, Any],
+    posterior_mode: str,
+    noise_cfg: dict[str, Any],
     grad_accum_steps: int,
     epoch: int,
     save_preview_dir: Path | None = None,
     global_step_start: int = 0,
     wandb_session=None,
     step_log_interval: int = 0,
+    use_progress_bar: bool = True,
+    progress_desc: str | None = None,
+    progress_update_interval: int = 10,
+    progress_mininterval: float = 0.5,
+    progress_leave: bool = False,
 ):
     import torch
     from torchvision.utils import save_image
 
-    vae.train(train)
-    total = recon = kl = feat = logit = noise_feat = 0.0
-    num_batches = 0
-    optimizer_step = int(global_step_start)
-
     autocast_enabled = amp_dtype is not None and device.type == "cuda"
-    preview_saved = False
-
+    vae.train(train)
     if train:
         optimizer.zero_grad(set_to_none=True)
 
-    def _maybe_log_step(terms, step_idx: int):
-        if (not train) or wandb_session is None or (not getattr(wandb_session, "enabled", False)):
+    total = recon = kl = feat = logit = noise_feat = 0.0
+    num_batches = 0
+    num_items = 0.0
+    optimizer_step = int(global_step_start)
+    preview_saved = False
+
+    total_batches = len(loader)
+    progress_update_interval = max(1, int(progress_update_interval))
+    progress = None
+    iterator = loader
+    if tqdm is not None and use_progress_bar:
+        progress = tqdm(
+            loader,
+            total=total_batches,
+            desc=progress_desc or ("train" if train else "val"),
+            dynamic_ncols=True,
+            leave=progress_leave,
+            mininterval=progress_mininterval,
+        )
+        iterator = progress
+
+    def _maybe_log_step(terms: dict[str, Any], step_idx: int) -> None:
+        if not train or wandb_session is None or not getattr(wandb_session, "enabled", False):
             return
-        if step_log_interval <= 0 or step_idx % max(1, step_log_interval) != 0:
+        if step_log_interval <= 0 or step_idx <= global_step_start or (step_idx % max(1, step_log_interval)) != 0:
             return
-        lr_now = float(optimizer.param_groups[0]["lr"])
         payload = {
             "train/global_step": step_idx,
             "train/epoch": epoch,
             "train/loss_step": float(terms["total"].detach().cpu()),
+            "train/loss_running": float(total / max(1.0, num_items)),
+            "train/lr": float(optimizer.param_groups[0]["lr"]),
             "train/recon_step": float(terms["recon"].detach().cpu()),
             "train/kl_step": float(terms["kl"].detach().cpu()),
             "train/feature_step": float(terms["feature"].detach().cpu()),
             "train/logit_step": float(terms["logit"].detach().cpu()),
             "train/noise_feature_step": float(terms["noise_feature"].detach().cpu()),
-            "train/loss_running": float(total / max(1, num_batches)),
-            "train/recon_running": float(recon / max(1, num_batches)),
-            "train/kl_running": float(kl / max(1, num_batches)),
-            "train/feature_running": float(feat / max(1, num_batches)),
-            "train/logit_running": float(logit / max(1, num_batches)),
-            "train/noise_feature_running": float(noise_feat / max(1, num_batches)),
-            "train/lr": lr_now,
         }
         try:
             if scaler is not None:
@@ -371,8 +390,11 @@ def _run_epoch(
             pass
         wandb_session.log(payload, step=step_idx)
 
-    for step, (images, _labels, _paths) in enumerate(loader):
-        images = images.to(device=device, dtype=torch.float32)
+    for step, (images, _labels, _paths) in enumerate(iterator, start=1):
+        images = images.to(device=device, dtype=torch.float32, non_blocking=(device.type == "cuda"))
+        batch_items = float(images.shape[0])
+        should_step = train and ((step % max(1, grad_accum_steps) == 0) or (step == total_batches))
+
         with torch.set_grad_enabled(train):
             with torch.autocast(device_type=device.type, dtype=amp_dtype, enabled=autocast_enabled):
                 terms = _compute_loss_terms(
@@ -394,7 +416,7 @@ def _run_epoch(
                 else:
                     loss.backward()
 
-                if (step + 1) % max(1, grad_accum_steps) == 0:
+                if should_step:
                     if scaler is not None:
                         scaler.step(optimizer)
                         scaler.update()
@@ -403,16 +425,27 @@ def _run_epoch(
                     optimizer.zero_grad(set_to_none=True)
                     optimizer_step += 1
 
-        total += float(terms["total"].detach().cpu())
-        recon += float(terms["recon"].detach().cpu())
-        kl += float(terms["kl"].detach().cpu())
-        feat += float(terms["feature"].detach().cpu())
-        logit += float(terms["logit"].detach().cpu())
-        noise_feat += float(terms["noise_feature"].detach().cpu())
+        total += float(terms["total"].detach().cpu()) * batch_items
+        recon += float(terms["recon"].detach().cpu()) * batch_items
+        kl += float(terms["kl"].detach().cpu()) * batch_items
+        feat += float(terms["feature"].detach().cpu()) * batch_items
+        logit += float(terms["logit"].detach().cpu()) * batch_items
+        noise_feat += float(terms["noise_feature"].detach().cpu()) * batch_items
         num_batches += 1
+        num_items += batch_items
 
-        if train and (step + 1) % max(1, grad_accum_steps) == 0:
+        if train and should_step:
             _maybe_log_step(terms, optimizer_step)
+
+        if progress is not None and (step % progress_update_interval == 0 or step == total_batches):
+            denom = float(max(1.0, num_items))
+            postfix = {
+                "loss": f"{(total / denom):.4f}",
+                "recon": f"{(recon / denom):.4f}",
+            }
+            if train:
+                postfix["lr"] = f"{optimizer.param_groups[0]['lr']:.2e}"
+            progress.set_postfix(postfix)
 
         if save_preview_dir is not None and not preview_saved:
             preview_saved = True
@@ -422,17 +455,10 @@ def _run_epoch(
             grid = torch.cat([orig, rec], dim=3)
             save_image(grid, save_preview_dir / f"epoch_{epoch:03d}.png")
 
-    if train and num_batches > 0 and (num_batches % max(1, grad_accum_steps) != 0):
-        if scaler is not None:
-            scaler.step(optimizer)
-            scaler.update()
-        else:
-            optimizer.step()
-        optimizer.zero_grad(set_to_none=True)
-        optimizer_step += 1
-        _maybe_log_step(terms, optimizer_step)
+    if progress is not None:
+        progress.close()
 
-    denom = float(max(1, num_batches))
+    denom = float(max(1.0, num_items))
     summary = EpochSummary(
         epoch=epoch,
         split="train" if train else "val",
@@ -562,6 +588,10 @@ def train_sd35_vae_from_config(cfg: dict[str, Any], config_path: str | Path) -> 
     epochs = int(train_cfg.get("epochs", 10))
     global_step = 0
     step_log_interval = int((cfg.get("wandb", {}) or {}).get("log_interval_steps", 0))
+    use_pbar = bool(train_cfg.get("progress_bar", True)) and (tqdm is not None)
+    pbar_mininterval = float(train_cfg.get("tqdm_mininterval", 0.5))
+    pbar_update_interval = int(train_cfg.get("tqdm_update_interval", 10))
+    pbar_leave = bool(train_cfg.get("tqdm_leave", False))
 
     try:
         for epoch in range(1, epochs + 1):
@@ -586,6 +616,11 @@ def train_sd35_vae_from_config(cfg: dict[str, Any], config_path: str | Path) -> 
                 global_step_start=global_step,
                 wandb_session=wandb_session,
                 step_log_interval=step_log_interval,
+                use_progress_bar=use_pbar,
+                progress_desc=f"Train {epoch}/{epochs}",
+                progress_update_interval=pbar_update_interval,
+                progress_mininterval=pbar_mininterval,
+                progress_leave=pbar_leave,
             )
             with torch.no_grad():
                 val_summary, _ = _run_epoch(
@@ -606,6 +641,11 @@ def train_sd35_vae_from_config(cfg: dict[str, Any], config_path: str | Path) -> 
                     grad_accum_steps=grad_accum_steps,
                     epoch=epoch,
                     global_step_start=global_step,
+                    use_progress_bar=use_pbar,
+                    progress_desc=f"Val   {epoch}/{epochs}",
+                    progress_update_interval=pbar_update_interval,
+                    progress_mininterval=pbar_mininterval,
+                    progress_leave=pbar_leave,
                 )
 
             history_rows.extend([train_summary.as_row(), val_summary.as_row()])
