@@ -7,6 +7,7 @@ from src.sd35_task_aware_vae.sd3.runtime import (
     build_runtime_context,
     maybe_build_quantized_transformer,
 )
+from src.sd35_task_aware_vae.sd3.transformer_factory import build_sd3_transformer, maybe_load_sd3_lora
 from src.sd35_task_aware_vae.sd3.vae_factory import build_sd3_vae
 
 
@@ -31,7 +32,7 @@ def _attach_components(pipe, *, vae=None, transformer=None, scheduler=None):
     return pipe
 
 
-def build_sd3_text2img_pipeline(model_cfg: dict[str, Any], vae_cfg: dict[str, Any] | None = None):
+def build_sd3_text2img_pipeline(model_cfg: dict[str, Any], vae_cfg: dict[str, Any] | None = None, transformer_cfg: dict[str, Any] | None = None):
     try:
         from diffusers import StableDiffusion3Pipeline
     except Exception as e:  # pragma: no cover - env dependent
@@ -39,7 +40,9 @@ def build_sd3_text2img_pipeline(model_cfg: dict[str, Any], vae_cfg: dict[str, An
 
     vae_cfg = vae_cfg or {}
     runtime = build_runtime_context(model_cfg)
-    transformer = maybe_build_quantized_transformer(model_cfg, runtime.torch_dtype)
+    transformer = build_sd3_transformer(model_cfg, transformer_cfg, torch_dtype=runtime.torch_dtype)
+    if transformer is None:
+        transformer = maybe_build_quantized_transformer(model_cfg, runtime.torch_dtype)
     vae = build_sd3_vae(model_cfg, vae_cfg, torch_dtype=runtime.torch_dtype, device=runtime.device)
 
     pipe = StableDiffusion3Pipeline.from_pretrained(
@@ -49,13 +52,16 @@ def build_sd3_text2img_pipeline(model_cfg: dict[str, Any], vae_cfg: dict[str, An
         torch_dtype=runtime.torch_dtype,
     )
     pipe = _attach_components(pipe, vae=vae, transformer=transformer)
+    pipe = maybe_load_sd3_lora(pipe, transformer_cfg=transformer_cfg, model_cfg=model_cfg)
     return apply_pipeline_runtime_options(pipe, model_cfg)
 
 
-def build_sd3_img2img_pipeline(model_cfg: dict[str, Any], vae_cfg: dict[str, Any] | None = None):
+def build_sd3_img2img_pipeline(model_cfg: dict[str, Any], vae_cfg: dict[str, Any] | None = None, transformer_cfg: dict[str, Any] | None = None):
     vae_cfg = vae_cfg or {}
     runtime = build_runtime_context(model_cfg)
-    transformer = maybe_build_quantized_transformer(model_cfg, runtime.torch_dtype)
+    transformer = build_sd3_transformer(model_cfg, transformer_cfg, torch_dtype=runtime.torch_dtype)
+    if transformer is None:
+        transformer = maybe_build_quantized_transformer(model_cfg, runtime.torch_dtype)
     vae = build_sd3_vae(model_cfg, vae_cfg, torch_dtype=runtime.torch_dtype, device=runtime.device)
 
     pipe = None
@@ -83,4 +89,5 @@ def build_sd3_img2img_pipeline(model_cfg: dict[str, Any], vae_cfg: dict[str, Any
         pipe = _attach_components(pipe, vae=vae, transformer=transformer)
 
     pipe = _attach_components(pipe, vae=vae, transformer=transformer)
+    pipe = maybe_load_sd3_lora(pipe, transformer_cfg=transformer_cfg, model_cfg=model_cfg)
     return apply_pipeline_runtime_options(pipe, model_cfg)
