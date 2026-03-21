@@ -6,6 +6,8 @@ from typing import Any
 
 import yaml
 
+from src.sd35_task_aware_vae.utils.device import get_gpu_ids, set_visible_gpus
+
 
 def load_yaml(path: str | Path) -> dict[str, Any]:
     with Path(path).open("r", encoding="utf-8") as f:
@@ -20,6 +22,9 @@ def main() -> None:
     args = parser.parse_args()
 
     cfg = load_yaml(args.config)
+    gpu_ids = get_gpu_ids(cfg)
+    set_visible_gpus(gpu_ids)
+
     model_cfg = cfg.get("model", {}) or {}
     vae_cfg = cfg.get("vae", {}) or {}
 

@@ -53,3 +53,20 @@ python -m src.scripts.run_sd3_generate_aug_from_config \
 
 - この環境では `diffusers` が未導入だったため、SD3.5 の end-to-end 実行そのものまでは検証していません。
 - ただし、全 Python ファイルの compile check と軽い pytest は通しています。
+
+
+## 2026-03 update: SD3.5 transformer fine-tuning
+
+- `src/scripts/train_sd3_finetune_from_config.py` を追加
+- `src/sd35_task_aware_vae/sd3/finetune.py` で以下を実装
+  - DiT full fine-tuning
+  - DiT LoRA fine-tuning
+  - optional VAE joint training
+  - YAML 駆動の train target 切り替え
+  - wandb logging
+  - `runtime.gpu_ids` による GPU 選択
+- 追加 config:
+  - `configs/sd3/train/sd35m_dit_full_ft.yaml`
+  - `configs/sd3/train/sd35m_dit_lora_ft.yaml`
+  - `configs/sd3/train/sd35m_joint_dit_vae_ft.yaml`
+- `train_vae_from_config.py` と `src/sd35_task_aware_vae/vae/trainer.py` にも wandb logging を追加
