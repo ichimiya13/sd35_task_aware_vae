@@ -1,0 +1,135 @@
+experiment_name: sd35m_dit_full_ft_a100x8_pilot
+seed: 42
+
+runtime:
+  gpu_ids: [0, 1, 2, 3, 4, 5, 6, 7]
+
+distributed:
+  enabled: true
+  backend: nccl
+  timeout_seconds: 7200
+  find_unused_parameters: false
+  broadcast_buffers: false
+
+data:
+  root: "../data/uwf/multilabel/MedicalCheckup/splitted"
+  split_filename: "default_split.yaml"
+  train_split: "train"
+  val_split: "val"
+  label_schema_file: "configs/labels/proposed_schema.yaml"
+  mean: [0.485, 0.456, 0.406]
+  std: [0.229, 0.224, 0.225]
+
+image:
+  center_crop_size: 3072
+  image_size: 1024
+
+augment:
+  hflip_p: 0.5
+
+model:
+  family: sd35
+  variant: medium
+  repo_id: stabilityai/stable-diffusion-3.5-medium
+  device: cuda
+  torch_dtype: bf16
+  load_dtype: bf16
+  allow_tf32: true
+  max_sequence_length: 256
+
+prompts:
+  mode: neutral
+  neutral_prompt: "ultra-widefield fundus photograph, clinical retinal imaging, medically faithful"
+  negative_prompt: "cartoon, illustration, painting, text overlay, watermark"
+  offload_static_text_encoders: false
+
+vae:
+  backend: sd35
+  subfolder: vae
+  checkpoint: null
+  posterior: mode
+
+train_targets:
+  transformer:
+    mode: full
+    checkpoint: null
+    freeze_patterns: []
+    unfreeze_patterns: []
+    upcast_trainable_params: false
+  vae:
+    enabled: false
+    posterior: mode
+    diffusion_gradients: false
+  text_encoders:
+    enabled: false
+
+optimizer:
+  name: adamw
+  lr: 5.0e-6
+  transformer_lr: 5.0e-6
+  weight_decay: 1.0e-2
+  betas: [0.9, 0.999]
+  eps: 1.0e-8
+  use_8bit_adam: false
+
+train:
+  epochs: 100
+  max_train_steps: 5000
+  batch_size: 2
+  num_workers: 4
+  grad_accum_steps: 1
+  drop_last: true
+  mixed_precision: bf16
+  gradient_checkpointing: true
+  lr_scheduler: constant_with_warmup
+  lr_warmup_steps: 250
+  log_interval_steps: 10
+  checkpoint_interval_steps: 500
+  checkpoint_total_limit: 6
+  num_val_batches: 64
+  resume_from: null
+  progress_bar: true
+  tqdm_update_interval: 5
+  tqdm_mininterval: 0.5
+  tqdm_leave: false
+
+diffusion_loss:
+  weighting_scheme: logit_normal
+  logit_mean: 0.0
+  logit_std: 1.0
+  mode_scale: 1.29
+  precondition_outputs: true
+  max_grad_norm: 1.0
+
+loss:
+  recon_type: l1
+  recon_weight: 1.0
+  kl_weight: 1.0e-6
+  feature_weight: 0.0
+  logit_weight: 0.0
+  noise_feature_weight: 0.0
+
+objective:
+  diffusion_weight: 1.0
+  vae_weight: 1.0
+
+preview:
+  enabled: true
+  kind: text2img
+  prompt: "ultra-widefield fundus photograph, realistic clinical retinal imaging, medically faithful"
+  negative_prompt: "cartoon, illustration, painting, text overlay, watermark"
+  num_inference_steps: 28
+  guidance_scale: 4.5
+  seed: 123
+
+output:
+  root_dir: outputs/checkpoints/sd3
+
+wandb:
+  enabled: true
+  project: uwf-sd35
+  name: sd35m_dit_full_ft_a100x8_pilot
+  group: a100x8_fullft
+  tags: ["sd35m", "dit-full", "a100x8", "pilot", "uwf"]
+  mode: online
+  log_interval_steps: 10

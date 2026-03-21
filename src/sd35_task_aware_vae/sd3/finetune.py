@@ -2,14 +2,21 @@ from __future__ import annotations
 
 import copy
 import math
+import os
 import re
 import shutil
+from contextlib import nullcontext
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Sequence
 
 import torch
 from torch.utils.data import DataLoader
+
+try:
+    from tqdm.auto import tqdm
+except Exception:  # pragma: no cover - optional dependency
+    tqdm = None
 
 from src.sd35_task_aware_vae.sd3.prompts import resolve_prompts
 from src.sd35_task_aware_vae.sd3.runtime import resolve_torch_dtype
@@ -72,6 +79,16 @@ class EpochMetrics:
             "logit_loss": self.logit_loss,
             "noise_feature_loss": self.noise_feature_loss,
         }
+
+
+@dataclass
+class DistributedContext:
+    use_ddp: bool
+    rank: int
+    local_rank: int
+    world_size: int
+    is_main_process: bool
+    device: torch.device
 
 
 class PromptManager:
@@ -715,6 +732,80 @@ def _build_training_latents(
 
 
 
+def _setup_distributed_context(cfg: dict[str, Any], model_cfg: dict[str, Any]) -> DistributedContext:
+    distributed_cfg = cfg.get("distributed", {}) or {}
+    requested_ddp = bool(distributed_cfg.get("enabled", False))
+    env_world_size = int(os.environ.get("WORLD_SIZE", "1"))
+    env_rank = int(os.environ.get("RANK", "0"))
+    env_local_rank = int(os.environ.get("LOCAL_RANK", "0"))
+
+    use_ddp = requested_ddp and env_world_size > 1 and torch.cuda.is_available()
+    if requested_ddp and env_world_size <= 1:
+        print(
+            "[warn] distributed.enabled=true but WORLD_SIZE=1. Launch with torchrun to enable DDP, or disable distributed.",
+            flush=True,
+        )
+
+    if use_ddp:
+        import datetime
+        import torch.distributed as dist
+
+        torch.cuda.set_device(env_local_rank)
+        if not dist.is_initialized():
+            timeout_seconds = int(distributed_cfg.get("timeout_seconds", 7200))
+            dist.init_process_group(
+                backend=str(distributed_cfg.get("backend", "nccl")),
+                init_method="env://",
+                timeout=datetime.timedelta(seconds=timeout_seconds),
+            )
+        device = torch.device(f"cuda:{env_local_rank}")
+    else:
+        if torch.cuda.is_available() and str(model_cfg.get("device", "cuda")) != "cpu":
+            try:
+                torch.cuda.set_device(0)
+            except Exception:
+                pass
+            device = torch.device("cuda")
+        else:
+            device = torch.device("cpu")
+
+    return DistributedContext(
+        use_ddp=use_ddp,
+        rank=env_rank if use_ddp else 0,
+        local_rank=env_local_rank if use_ddp else 0,
+        world_size=env_world_size if use_ddp else 1,
+        is_main_process=(env_rank == 0) if use_ddp else True,
+        device=device,
+    )
+
+
+
+def _barrier_if_needed(context: DistributedContext) -> None:
+    if not context.use_ddp:
+        return
+    try:
+        import torch.distributed as dist
+
+        if dist.is_available() and dist.is_initialized():
+            dist.barrier()
+    except Exception:
+        pass
+
+
+
+def _cleanup_distributed(context: DistributedContext | None) -> None:
+    if context is None or not context.use_ddp:
+        return
+    try:
+        import torch.distributed as dist
+
+        if dist.is_available() and dist.is_initialized():
+            dist.destroy_process_group()
+    except Exception:
+        pass
+
+
+
 def _run_epoch(
     *,
     pipe,
@@ -748,11 +839,20 @@ def _run_epoch(
     max_batches: int | None = None,
     vae_diffusion_gradients: bool = False,
     max_grad_norm: float = 0.0,
+    use_progress_bar: bool = True,
+    progress_desc: str | None = None,
+    progress_update_interval: int = 10,
+    progress_mininterval: float = 0.5,
+    progress_leave: bool = False,
+    is_main_process: bool = True,
+    use_distributed: bool = False,
+    ddp_no_sync_module=None,
 ):
     autocast_enabled = amp_dtype is not None and device.type == "cuda"
     total_loss = diffusion_loss = vae_loss = 0.0
     recon_loss = kl_loss = feature_loss = logit_loss = noise_feature_loss = 0.0
     num_batches = 0
+    num_items = 0.0
     global_step = int(global_step_start)
 
     transformer.train(train and train_transformer)
@@ -764,93 +864,132 @@ def _run_epoch(
     objective_diffusion_weight = float(objective_cfg.get("diffusion_weight", 1.0))
     objective_vae_weight = float(objective_cfg.get("vae_weight", 1.0))
 
-    for batch_idx, (images, labels, _paths) in enumerate(loader):
-        if max_batches is not None and batch_idx >= max_batches:
+    total_batches = len(loader)
+    if max_batches is not None:
+        total_batches = min(int(max_batches), total_batches)
+    progress_update_interval = max(1, int(progress_update_interval))
+
+    progress = None
+    iterator = loader
+    if tqdm is not None and use_progress_bar and is_main_process:
+        progress = tqdm(
+            loader,
+            total=total_batches,
+            desc=progress_desc or ("train" if train else "val"),
+            dynamic_ncols=True,
+            leave=progress_leave,
+            mininterval=progress_mininterval,
+        )
+        iterator = progress
+
+    for batch_idx, (images, labels, _paths) in enumerate(iterator, start=1):
+        if batch_idx > total_batches:
             break
-        images = images.to(device=device, dtype=torch.float32)
-        labels = labels.to(device=device, dtype=torch.float32)
 
-        with torch.set_grad_enabled(train):
-            with torch.autocast(device_type=device.type, dtype=amp_dtype, enabled=autocast_enabled):
-                prompt_batch = prompt_manager.encode_batch(labels)
-                terms_total = images.new_tensor(0.0)
-                diffusion_terms = None
-                vae_terms = None
+        images = images.to(device=device, dtype=torch.float32, non_blocking=(device.type == "cuda"))
+        labels = labels.to(device=device, dtype=torch.float32, non_blocking=(device.type == "cuda"))
+        batch_items = float(images.shape[0])
+        should_step = train and ((batch_idx % max(1, grad_accum_steps) == 0) or (batch_idx == total_batches))
 
-                if train_transformer:
-                    latents = _build_training_latents(
-                        vae=vae,
-                        images=images,
-                        posterior_mode=posterior_mode,
-                        requires_grad=(train and train_vae and vae_diffusion_gradients),
-                        target_dtype=(amp_dtype if amp_dtype is not None else torch.float32),
-                    )
-                    diffusion_terms = _compute_diffusion_terms(
-                        transformer=transformer,
-                        prompt_batch=prompt_batch,
-                        latents=latents,
-                        noise_scheduler=pipe.scheduler,
-                        diffusion_cfg=diffusion_cfg,
-                    )
-                    terms_total = terms_total + objective_diffusion_weight * diffusion_terms["loss"]
+        sync_context = nullcontext()
+        if train and ddp_no_sync_module is not None and not should_step:
+            sync_context = ddp_no_sync_module.no_sync()
 
-                if train_vae:
-                    vae_terms = _compute_loss_terms(
-                        vae=vae,
-                        batch=images,
-                        teacher=teacher,
-                        mean=mean,
-                        std=std,
-                        loss_cfg=loss_cfg,
-                        teacher_cfg=teacher_cfg,
-                        posterior_mode=posterior_mode,
-                        noise_cfg=noise_cfg,
-                    )
-                    terms_total = terms_total + objective_vae_weight * vae_terms["total"]
+        with sync_context:
+            with torch.set_grad_enabled(train):
+                with torch.autocast(device_type=device.type, dtype=amp_dtype, enabled=autocast_enabled):
+                    prompt_batch = prompt_manager.encode_batch(labels)
+                    terms_total = images.new_tensor(0.0)
+                    diffusion_terms = None
+                    vae_terms = None
 
-                loss = terms_total / float(max(1, grad_accum_steps))
+                    if train_transformer:
+                        latents = _build_training_latents(
+                            vae=vae,
+                            images=images,
+                            posterior_mode=posterior_mode,
+                            requires_grad=(train and train_vae and vae_diffusion_gradients),
+                            target_dtype=(amp_dtype if amp_dtype is not None else torch.float32),
+                        )
+                        diffusion_terms = _compute_diffusion_terms(
+                            transformer=transformer,
+                            prompt_batch=prompt_batch,
+                            latents=latents,
+                            noise_scheduler=pipe.scheduler,
+                            diffusion_cfg=diffusion_cfg,
+                        )
+                        terms_total = terms_total + objective_diffusion_weight * diffusion_terms["loss"]
 
-            if train:
-                if scaler is not None:
-                    scaler.scale(loss).backward()
-                else:
-                    loss.backward()
+                    if train_vae:
+                        vae_terms = _compute_loss_terms(
+                            vae=vae,
+                            batch=images,
+                            teacher=teacher,
+                            mean=mean,
+                            std=std,
+                            loss_cfg=loss_cfg,
+                            teacher_cfg=teacher_cfg,
+                            posterior_mode=posterior_mode,
+                            noise_cfg=noise_cfg,
+                        )
+                        terms_total = terms_total + objective_vae_weight * vae_terms["total"]
 
-                if (batch_idx + 1) % max(1, grad_accum_steps) == 0:
+                    loss = terms_total / float(max(1, grad_accum_steps))
+
+                if train:
                     if scaler is not None:
-                        scaler.unscale_(optimizer)
-                    if max_grad_norm > 0:
-                        params_to_clip = [p for group in optimizer.param_groups for p in group["params"] if p.requires_grad]
-                        torch.nn.utils.clip_grad_norm_(params_to_clip, max_grad_norm)
-                    if scaler is not None:
-                        scaler.step(optimizer)
-                        scaler.update()
+                        scaler.scale(loss).backward()
                     else:
-                        optimizer.step()
-                    if lr_scheduler is not None:
-                        lr_scheduler.step()
-                    optimizer.zero_grad(set_to_none=True)
-                    global_step += 1
+                        loss.backward()
+
+                    if should_step:
+                        if scaler is not None:
+                            scaler.unscale_(optimizer)
+                        if max_grad_norm > 0:
+                            params_to_clip = [p for group in optimizer.param_groups for p in group["params"] if p.requires_grad]
+                            torch.nn.utils.clip_grad_norm_(params_to_clip, max_grad_norm)
+                        if scaler is not None:
+                            scaler.step(optimizer)
+                            scaler.update()
+                        else:
+                            optimizer.step()
+                        if lr_scheduler is not None:
+                            lr_scheduler.step()
+                        optimizer.zero_grad(set_to_none=True)
+                        global_step += 1
 
         num_batches += 1
-        total_loss += float(terms_total.detach().cpu())
+        num_items += batch_items
+        total_loss += float(terms_total.detach().cpu()) * batch_items
         if diffusion_terms is not None:
-            diffusion_loss += float(diffusion_terms["loss"].detach().cpu())
+            diffusion_loss += float(diffusion_terms["loss"].detach().cpu()) * batch_items
         if vae_terms is not None:
-            vae_loss += float(vae_terms["total"].detach().cpu())
-            recon_loss += float(vae_terms["recon"].detach().cpu())
-            kl_loss += float(vae_terms["kl"].detach().cpu())
-            feature_loss += float(vae_terms["feature"].detach().cpu())
-            logit_loss += float(vae_terms["logit"].detach().cpu())
-            noise_feature_loss += float(vae_terms["noise_feature"].detach().cpu())
+            vae_loss += float(vae_terms["total"].detach().cpu()) * batch_items
+            recon_loss += float(vae_terms["recon"].detach().cpu()) * batch_items
+            kl_loss += float(vae_terms["kl"].detach().cpu()) * batch_items
+            feature_loss += float(vae_terms["feature"].detach().cpu()) * batch_items
+            logit_loss += float(vae_terms["logit"].detach().cpu()) * batch_items
+            noise_feature_loss += float(vae_terms["noise_feature"].detach().cpu()) * batch_items
+
+        if progress is not None and (batch_idx % progress_update_interval == 0 or batch_idx == total_batches):
+            denom = float(max(1.0, num_items))
+            postfix: dict[str, str] = {"loss": f"{(total_loss / denom):.4f}"}
+            if diffusion_terms is not None:
+                postfix["diff"] = f"{(diffusion_loss / denom):.4f}"
+            if vae_terms is not None:
+                postfix["vae"] = f"{(vae_loss / denom):.4f}"
+            if train:
+                postfix["lr"] = f"{optimizer.param_groups[0]['lr']:.2e}"
+            progress.set_postfix(postfix)
 
         if train and wandb_session is not None and getattr(wandb_session, "enabled", False):
-            if step_log_interval > 0 and global_step > global_step_start and global_step % max(1, step_log_interval) == 0 and (batch_idx + 1) % max(1, grad_accum_steps) == 0:
+            if step_log_interval > 0 and should_step and global_step > global_step_start and global_step % max(1, step_log_interval) == 0:
+                running_denom = float(max(1.0, num_items))
                 payload = {
                     "train/global_step": global_step,
                     "train/epoch": epoch,
                     "train/loss_step": float(terms_total.detach().cpu()),
-                    "train/loss_running": float(total_loss / max(1, num_batches)),
+                    "train/loss_running": float(total_loss / running_denom),
                     "train/lr": float(optimizer.param_groups[0]["lr"]),
                 }
                 if diffusion_terms is not None:
@@ -875,23 +1014,44 @@ def _run_epoch(
                     pass
                 wandb_session.log(payload, step=global_step)
 
-    if train and num_batches > 0 and (num_batches % max(1, grad_accum_steps) != 0):
-        if scaler is not None:
-            scaler.unscale_(optimizer)
-        if max_grad_norm > 0:
-            params_to_clip = [p for group in optimizer.param_groups for p in group["params"] if p.requires_grad]
-            torch.nn.utils.clip_grad_norm_(params_to_clip, max_grad_norm)
-        if scaler is not None:
-            scaler.step(optimizer)
-            scaler.update()
-        else:
-            optimizer.step()
-        if lr_scheduler is not None:
-            lr_scheduler.step()
-        optimizer.zero_grad(set_to_none=True)
-        global_step += 1
+    if progress is not None:
+        progress.close()
 
-    denom = float(max(1, num_batches))
+    if use_distributed:
+        try:
+            import torch.distributed as dist
+
+            packed = torch.tensor(
+                [
+                    total_loss,
+                    diffusion_loss,
+                    vae_loss,
+                    recon_loss,
+                    kl_loss,
+                    feature_loss,
+                    logit_loss,
+                    noise_feature_loss,
+                    num_items,
+                ],
+                device=device,
+                dtype=torch.float64,
+            )
+            dist.all_reduce(packed, op=dist.ReduceOp.SUM)
+            (
+                total_loss,
+                diffusion_loss,
+                vae_loss,
+                recon_loss,
+                kl_loss,
+                feature_loss,
+                logit_loss,
+                noise_feature_loss,
+                num_items,
+            ) = [float(x) for x in packed.tolist()]
+        except Exception:
+            pass
+
+    denom = float(max(1.0, num_items))
     metrics = EpochMetrics(
         epoch=epoch,
         split="train" if train else "val",
@@ -917,276 +1077,332 @@ def train_sd35_system_from_config(cfg: dict[str, Any], config_path: str | Path) 
     cfg, resume_dir = _prepare_resume_sources(cfg)
     resume_state = _load_resume_state(resume_dir)
 
-    seed_everything(int(cfg.get("seed", 42)), deterministic=bool(cfg.get("deterministic", False)))
-
-    exp_name = str(cfg.get("experiment_name", "sd35_system_finetune"))
-    out_root = ensure_dir((cfg.get("output", {}) or {}).get("root_dir", "outputs/checkpoints/sd3"))
-    out_dir = ensure_dir(out_root / exp_name)
-    ensure_dir(out_dir / "last")
-    ensure_dir(out_dir / "best")
-    ensure_dir(out_dir / "previews")
-    checkpoint_root = ensure_dir(out_dir / "checkpoints")
-    dump_yaml(cfg, out_dir / "config_used.yaml")
-
     model_cfg = cfg.get("model", {}) or {}
-    vae_cfg = cfg.get("vae", {}) or {}
-    train_cfg = cfg.get("train", {}) or {}
-    teacher_cfg = cfg.get("teacher", {}) or {}
-    loss_cfg = cfg.get("loss", {}) or {}
-    diffusion_cfg = cfg.get("diffusion_loss", {}) or {}
-    objective_cfg = cfg.get("objective", {}) or {}
-    prompt_cfg = cfg.get("prompt", cfg.get("prompts", {})) or {}
-    preview_cfg = cfg.get("preview", {}) or {}
-    train_targets = _resolve_train_targets(cfg)
-    transformer_cfg = train_targets.get("transformer", {}) or {}
-    target_vae_cfg = train_targets.get("vae", {}) or {}
-    text_cfg = train_targets.get("text_encoders", {}) or {}
-    lora_cfg = cfg.get("lora", {}) or {}
-    noise_cfg = cfg.get("noise_conditioning", {}) or {}
+    dist_context = _setup_distributed_context(cfg, model_cfg)
+    wandb_session = None
+    try:
+        seed_everything(int(cfg.get("seed", 42)) + int(dist_context.rank), deterministic=bool(cfg.get("deterministic", False)))
 
-    if bool(text_cfg.get("enabled", False)):
-        raise NotImplementedError("Text-encoder fine-tuning is not implemented in this repo yet. Keep train_targets.text_encoders.enabled=false.")
+        exp_name = str(cfg.get("experiment_name", "sd35_system_finetune"))
+        out_root = ensure_dir((cfg.get("output", {}) or {}).get("root_dir", "outputs/checkpoints/sd3"))
+        out_dir = ensure_dir(out_root / exp_name)
+        checkpoint_root = ensure_dir(out_dir / "checkpoints")
+        if dist_context.is_main_process:
+            ensure_dir(out_dir / "last")
+            ensure_dir(out_dir / "best")
+            ensure_dir(out_dir / "previews")
+            dump_yaml(cfg, out_dir / "config_used.yaml")
+        _barrier_if_needed(dist_context)
 
-    transformer_mode = str(transformer_cfg.get("mode", "full")).lower()
-    if transformer_mode not in {"full", "lora", "frozen", "off", "none"}:
-        raise ValueError(f"Unsupported transformer mode: {transformer_mode}")
+        vae_cfg = cfg.get("vae", {}) or {}
+        train_cfg = cfg.get("train", {}) or {}
+        teacher_cfg = cfg.get("teacher", {}) or {}
+        loss_cfg = cfg.get("loss", {}) or {}
+        diffusion_cfg = cfg.get("diffusion_loss", {}) or {}
+        objective_cfg = cfg.get("objective", {}) or {}
+        prompt_cfg = cfg.get("prompt", cfg.get("prompts", {})) or {}
+        preview_cfg = cfg.get("preview", {}) or {}
+        train_targets = _resolve_train_targets(cfg)
+        transformer_cfg = train_targets.get("transformer", {}) or {}
+        target_vae_cfg = train_targets.get("vae", {}) or {}
+        text_cfg = train_targets.get("text_encoders", {}) or {}
+        lora_cfg = cfg.get("lora", {}) or {}
+        noise_cfg = cfg.get("noise_conditioning", {}) or {}
+        distributed_cfg = cfg.get("distributed", {}) or {}
 
-    train_transformer = transformer_mode not in {"frozen", "off", "none"}
-    train_vae = bool(target_vae_cfg.get("enabled", False))
-    vae_diffusion_gradients = bool(target_vae_cfg.get("diffusion_gradients", False))
-    posterior_mode = str(target_vae_cfg.get("posterior", vae_cfg.get("posterior", "mode")))
+        if bool(text_cfg.get("enabled", False)):
+            raise NotImplementedError("Text-encoder fine-tuning is not implemented in this repo yet. Keep train_targets.text_encoders.enabled=false.")
 
-    if not train_transformer and not train_vae:
-        raise ValueError("Nothing to train. Enable train_targets.transformer or train_targets.vae.")
+        transformer_mode = str(transformer_cfg.get("mode", "full")).lower()
+        if transformer_mode not in {"full", "lora", "frozen", "off", "none"}:
+            raise ValueError(f"Unsupported transformer mode: {transformer_mode}")
 
-    device = torch.device(
-        model_cfg.get("device", "cuda") if torch.cuda.is_available() and str(model_cfg.get("device", "cuda")) != "cpu" else "cpu"
-    )
-    load_dtype = resolve_torch_dtype(model_cfg.get("load_dtype", model_cfg.get("torch_dtype", "bf16" if device.type == "cuda" else "fp32")))
-    mixed_precision_str = str(train_cfg.get("mixed_precision", model_cfg.get("torch_dtype", "bf16" if device.type == "cuda" else "fp32"))).lower()
-    amp_dtype = None
-    if device.type == "cuda":
-        if mixed_precision_str in {"fp16", "float16", "half"}:
-            amp_dtype = torch.float16
-        elif mixed_precision_str in {"bf16", "bfloat16"}:
-            amp_dtype = torch.bfloat16
+        train_transformer = transformer_mode not in {"frozen", "off", "none"}
+        train_vae = bool(target_vae_cfg.get("enabled", False))
+        vae_diffusion_gradients = bool(target_vae_cfg.get("diffusion_gradients", False))
+        posterior_mode = str(target_vae_cfg.get("posterior", vae_cfg.get("posterior", "mode")))
 
-    if bool(model_cfg.get("allow_tf32", False)) and device.type == "cuda":
-        try:
-            torch.backends.cuda.matmul.allow_tf32 = True
-            torch.backends.cudnn.allow_tf32 = True
-        except Exception:
-            pass
+        if not train_transformer and not train_vae:
+            raise ValueError("Nothing to train. Enable train_targets.transformer or train_targets.vae.")
+        if dist_context.use_ddp and train_vae:
+            raise NotImplementedError(
+                "DDP is currently supported for DiT-only / LoRA training. Keep train_targets.vae.enabled=false when distributed.enabled=true."
+            )
 
-    train_ds, val_ds, class_names = build_datasets(cfg)
-    batch_size = int(train_cfg.get("batch_size", 1))
-    num_workers = int(train_cfg.get("num_workers", 4))
-    grad_accum_steps = int(train_cfg.get("grad_accum_steps", 1))
-    train_loader = DataLoader(
-        train_ds,
-        batch_size=batch_size,
-        shuffle=True,
-        num_workers=num_workers,
-        pin_memory=(device.type == "cuda"),
-        drop_last=bool(train_cfg.get("drop_last", True)),
-    )
-    val_loader = DataLoader(
-        val_ds,
-        batch_size=batch_size,
-        shuffle=False,
-        num_workers=num_workers,
-        pin_memory=(device.type == "cuda"),
-    )
+        device = dist_context.device
+        load_dtype = resolve_torch_dtype(model_cfg.get("load_dtype", model_cfg.get("torch_dtype", "bf16" if device.type == "cuda" else "fp32")))
+        mixed_precision_str = str(train_cfg.get("mixed_precision", model_cfg.get("torch_dtype", "bf16" if device.type == "cuda" else "fp32"))).lower()
+        amp_dtype = None
+        if device.type == "cuda":
+            if mixed_precision_str in {"fp16", "float16", "half"}:
+                amp_dtype = torch.float16
+            elif mixed_precision_str in {"bf16", "bfloat16"}:
+                amp_dtype = torch.bfloat16
 
-    custom_transformer = _build_sd3_transformer(model_cfg, transformer_cfg, torch_dtype=load_dtype)
-    custom_vae = build_sd3_vae(model_cfg, vae_cfg, torch_dtype=load_dtype, device=None)
-    
-    print("custom_transformer:", type(custom_transformer))
-    print("custom_vae:", type(custom_vae))
-    if custom_vae is None:
-        raise RuntimeError("build_sd3_vae returned None.")
-    if custom_transformer is None:
-        raise RuntimeError("_build_sd3_transformer returned None.")
+        if bool(model_cfg.get("allow_tf32", False)) and device.type == "cuda":
+            try:
+                torch.backends.cuda.matmul.allow_tf32 = True
+                torch.backends.cudnn.allow_tf32 = True
+            except Exception:
+                pass
 
-    pipe = StableDiffusion3Pipeline.from_pretrained(
-        str(model_cfg["repo_id"]),
-        transformer=custom_transformer,
-        vae=custom_vae,
-        torch_dtype=load_dtype,
-    )
-    
-    print("pipe.transformer:", type(pipe.transformer))
-    print("pipe.vae:", type(pipe.vae))
-    
-    pipe.to(device)
+        train_ds, val_ds, class_names = build_datasets(cfg)
+        batch_size = int(train_cfg.get("batch_size", 1))
+        num_workers = int(train_cfg.get("num_workers", 4))
+        grad_accum_steps = int(train_cfg.get("grad_accum_steps", 1))
+        drop_last = bool(train_cfg.get("drop_last", True))
 
-    transformer = pipe.transformer
-    vae = pipe.vae
-    if transformer is None or vae is None:
-        raise RuntimeError("Failed to initialize SD3 pipeline components.")
+        train_sampler = None
+        val_sampler = None
+        if dist_context.use_ddp:
+            from torch.utils.data import DistributedSampler
 
-    pipe.scheduler = copy.deepcopy(pipe.scheduler)
-    _ensure_scheduler_state(pipe.scheduler, device)
+            train_sampler = DistributedSampler(
+                train_ds,
+                num_replicas=dist_context.world_size,
+                rank=dist_context.rank,
+                shuffle=True,
+                drop_last=drop_last,
+            )
+            val_sampler = DistributedSampler(
+                val_ds,
+                num_replicas=dist_context.world_size,
+                rank=dist_context.rank,
+                shuffle=False,
+                drop_last=False,
+            )
 
-    if bool(train_cfg.get("gradient_checkpointing", False)) and hasattr(transformer, "enable_gradient_checkpointing"):
-        transformer.enable_gradient_checkpointing()
+        train_loader = DataLoader(
+            train_ds,
+            batch_size=batch_size,
+            shuffle=(train_sampler is None),
+            sampler=train_sampler,
+            num_workers=num_workers,
+            pin_memory=(device.type == "cuda"),
+            drop_last=drop_last,
+        )
+        val_loader = DataLoader(
+            val_ds,
+            batch_size=batch_size,
+            shuffle=False,
+            sampler=val_sampler,
+            num_workers=num_workers,
+            pin_memory=(device.type == "cuda"),
+        )
 
-    for p in transformer.parameters():
-        p.requires_grad_(False)
-    for p in vae.parameters():
-        p.requires_grad_(False)
+        custom_transformer = _build_sd3_transformer(model_cfg, transformer_cfg, torch_dtype=load_dtype)
+        custom_vae = build_sd3_vae(model_cfg, vae_cfg, torch_dtype=load_dtype, device=None)
+        if custom_vae is None:
+            raise RuntimeError("build_sd3_vae returned None.")
+        if custom_transformer is None:
+            raise RuntimeError("_build_sd3_transformer returned None.")
 
-    if train_transformer:
-        if transformer_mode == "full":
-            for p in transformer.parameters():
+        pipe = StableDiffusion3Pipeline.from_pretrained(
+            str(model_cfg["repo_id"]),
+            transformer=custom_transformer,
+            vae=custom_vae,
+            torch_dtype=load_dtype,
+        )
+        pipe.to(device)
+
+        transformer = pipe.transformer
+        vae = pipe.vae
+        if transformer is None or vae is None:
+            raise RuntimeError("Failed to initialize SD3 pipeline components.")
+
+        pipe.scheduler = copy.deepcopy(pipe.scheduler)
+        _ensure_scheduler_state(pipe.scheduler, device)
+
+        if bool(train_cfg.get("gradient_checkpointing", False)) and hasattr(transformer, "enable_gradient_checkpointing"):
+            transformer.enable_gradient_checkpointing()
+
+        for p in transformer.parameters():
+            p.requires_grad_(False)
+        for p in vae.parameters():
+            p.requires_grad_(False)
+
+        if train_transformer:
+            if transformer_mode == "full":
+                for p in transformer.parameters():
+                    p.requires_grad_(True)
+                apply_freeze_patterns(
+                    transformer,
+                    freeze_patterns=[str(x) for x in (transformer_cfg.get("freeze_patterns", []) or [])],
+                    unfreeze_patterns=[str(x) for x in (transformer_cfg.get("unfreeze_patterns", []) or [])],
+                )
+                if bool(transformer_cfg.get("upcast_trainable_params", False)):
+                    for p in transformer.parameters():
+                        if p.requires_grad:
+                            p.data = p.data.float()
+            elif transformer_mode == "lora":
+                target_modules = _apply_transformer_lora(transformer, lora_cfg)
+                transformer_cfg["resolved_lora_target_modules"] = target_modules
+                transformer = _load_lora_checkpoint_if_needed(transformer, transformer_cfg)
+                if hasattr(pipe, "register_modules"):
+                    pipe.register_modules(transformer=transformer)
+                else:
+                    pipe.transformer = transformer
+
+        if train_vae:
+            for p in vae.parameters():
                 p.requires_grad_(True)
             apply_freeze_patterns(
-                transformer,
-                freeze_patterns=[str(x) for x in (transformer_cfg.get("freeze_patterns", []) or [])],
-                unfreeze_patterns=[str(x) for x in (transformer_cfg.get("unfreeze_patterns", []) or [])],
+                vae,
+                freeze_patterns=[str(x) for x in (target_vae_cfg.get("freeze_patterns", vae_cfg.get("freeze_patterns", [])) or [])],
+                unfreeze_patterns=[str(x) for x in (target_vae_cfg.get("unfreeze_patterns", vae_cfg.get("unfreeze_patterns", [])) or [])],
             )
-            if bool(transformer_cfg.get("upcast_trainable_params", False)):
-                for p in transformer.parameters():
+            if bool(target_vae_cfg.get("upcast_trainable_params", False)):
+                for p in vae.parameters():
                     if p.requires_grad:
                         p.data = p.data.float()
-        elif transformer_mode == "lora":
-            target_modules = _apply_transformer_lora(transformer, lora_cfg)
-            transformer_cfg["resolved_lora_target_modules"] = target_modules
-            transformer = _load_lora_checkpoint_if_needed(transformer, transformer_cfg)
-            if hasattr(pipe, "register_modules"):
-                pipe.register_modules(transformer=transformer)
-            else:
-                pipe.transformer = transformer
 
-    if train_vae:
-        for p in vae.parameters():
-            p.requires_grad_(True)
-        apply_freeze_patterns(
-            vae,
-            freeze_patterns=[str(x) for x in (target_vae_cfg.get("freeze_patterns", vae_cfg.get("freeze_patterns", [])) or [])],
-            unfreeze_patterns=[str(x) for x in (target_vae_cfg.get("unfreeze_patterns", vae_cfg.get("unfreeze_patterns", [])) or [])],
+        prompt_manager = PromptManager(
+            pipe,
+            prompt_cfg=prompt_cfg,
+            class_names=class_names,
+            device=device,
+            max_sequence_length=int(model_cfg.get("max_sequence_length", prompt_cfg.get("max_sequence_length", 256))),
+            offload_static_text_encoders=bool(prompt_cfg.get("offload_static_text_encoders", False)),
         )
-        if bool(target_vae_cfg.get("upcast_trainable_params", False)):
-            for p in vae.parameters():
-                if p.requires_grad:
-                    p.data = p.data.float()
 
-    prompt_manager = PromptManager(
-        pipe,
-        prompt_cfg=prompt_cfg,
-        class_names=class_names,
-        device=device,
-        max_sequence_length=int(model_cfg.get("max_sequence_length", prompt_cfg.get("max_sequence_length", 256))),
-        offload_static_text_encoders=bool(prompt_cfg.get("offload_static_text_encoders", False)),
-    )
+        teacher = build_teacher_if_needed(
+            {**cfg, "loss": loss_cfg, "teacher": teacher_cfg},
+            num_classes=len(class_names),
+            device=device,
+        ) if train_vae else None
+        mean, std = _teacher_stats(cfg)
 
-    teacher = build_teacher_if_needed(
-        {**cfg, "loss": loss_cfg, "teacher": teacher_cfg},
-        num_classes=len(class_names),
-        device=device,
-    ) if train_vae else None
-    mean, std = _teacher_stats(cfg)
+        optimizer_cfg = cfg.get("optimizer", {}) or {}
+        param_groups, trainable_counts = _collect_trainable_param_groups(
+            transformer=transformer,
+            vae=vae,
+            transformer_mode=transformer_mode,
+            train_transformer=train_transformer,
+            train_vae=train_vae,
+            optimizer_cfg=optimizer_cfg,
+        )
+        optimizer = _build_optimizer(param_groups, optimizer_cfg)
 
-    optimizer_cfg = cfg.get("optimizer", {}) or {}
-    param_groups, trainable_counts = _collect_trainable_param_groups(
-        transformer=transformer,
-        vae=vae,
-        transformer_mode=transformer_mode,
-        train_transformer=train_transformer,
-        train_vae=train_vae,
-        optimizer_cfg=optimizer_cfg,
-    )
-    optimizer = _build_optimizer(param_groups, optimizer_cfg)
-
-    updates_per_epoch = max(1, math.ceil(len(train_loader) / max(1, grad_accum_steps)))
-    max_train_steps = train_cfg.get("max_train_steps", None)
-    epochs = int(train_cfg.get("epochs", 1))
-    if max_train_steps is None:
-        max_train_steps = updates_per_epoch * epochs
-    else:
-        max_train_steps = int(max_train_steps)
-        epochs = int(math.ceil(max_train_steps / float(updates_per_epoch)))
-
-    lr_scheduler = _build_lr_scheduler(optimizer, train_cfg, total_steps=max_train_steps)
-    scaler = torch.cuda.amp.GradScaler(enabled=(amp_dtype == torch.float16 and device.type == "cuda"))
-    if not (amp_dtype == torch.float16 and device.type == "cuda"):
-        scaler = None
-
-    start_epoch = 0
-    global_step = 0
-    best_val = math.inf
-    history_rows: list[dict[str, Any]] = []
-    if resume_state is not None:
-        try:
-            optimizer.load_state_dict(resume_state.get("optimizer", {}))
-        except Exception as e:
-            print(f"[warn] failed to load optimizer state: {e}", flush=True)
-        if lr_scheduler is not None and resume_state.get("scheduler", None) is not None:
-            try:
-                lr_scheduler.load_state_dict(resume_state["scheduler"])
-            except Exception as e:
-                print(f"[warn] failed to load lr scheduler state: {e}", flush=True)
-        if scaler is not None and resume_state.get("scaler", None) is not None:
-            try:
-                scaler.load_state_dict(resume_state["scaler"])
-            except Exception as e:
-                print(f"[warn] failed to load scaler state: {e}", flush=True)
-        start_epoch = int(resume_state.get("epoch", 0))
-        global_step = int(resume_state.get("global_step", 0))
-        best_val = float(resume_state.get("best_val_total_loss", math.inf))
-        history_rows = list(resume_state.get("history", [])) if isinstance(resume_state.get("history", []), list) else []
-
-    wandb_session = init_wandb_session(
-        cfg,
-        out_dir=out_dir,
-        experiment_name=exp_name,
-        default_project="sd35-system-finetune",
-        enabled=True,
-    )
-    wandb_session.set_summary("transformer_mode", transformer_mode)
-    wandb_session.set_summary("train_transformer_params", trainable_counts["transformer"])
-    wandb_session.set_summary("train_vae_params", trainable_counts["vae"])
-    wandb_session.set_summary("num_train_samples", len(train_ds))
-    wandb_session.set_summary("num_val_samples", len(val_ds))
-
-    step_log_interval = int((cfg.get("wandb", {}) or {}).get("log_interval_steps", train_cfg.get("log_interval_steps", 0)))
-    save_every_n_steps = int(train_cfg.get("checkpoint_interval_steps", 0))
-    save_total_limit = int(train_cfg.get("checkpoint_total_limit", train_cfg.get("save_total_limit", 3)))
-    num_val_batches = train_cfg.get("num_val_batches", None)
-    if num_val_batches is not None:
-        num_val_batches = int(num_val_batches)
-
-    best_epoch = int(resume_state.get("best_epoch", -1)) if resume_state is not None else -1
-
-    def _save_checkpoint(target_dir: Path, epoch_idx: int, step_idx: int, val_metrics: EpochMetrics | None) -> None:
-        target_dir.mkdir(parents=True, exist_ok=True)
-        if transformer_mode == "lora":
-            _save_lora_weights(pipe, transformer, target_dir / "lora")
+        updates_per_epoch = max(1, math.ceil(len(train_loader) / max(1, grad_accum_steps)))
+        max_train_steps = train_cfg.get("max_train_steps", None)
+        epochs = int(train_cfg.get("epochs", 1))
+        if max_train_steps is None:
+            max_train_steps = updates_per_epoch * epochs
         else:
-            transformer.save_pretrained(target_dir / "transformer")
-        if train_vae or bool(target_vae_cfg.get("save_even_if_frozen", False)):
-            vae.save_pretrained(target_dir / "vae")
-        torch.save(
-            {
-                "epoch": epoch_idx,
-                "global_step": step_idx,
-                "best_val_total_loss": best_val,
-                "best_epoch": best_epoch,
-                "optimizer": optimizer.state_dict(),
-                "scheduler": lr_scheduler.state_dict() if lr_scheduler is not None else None,
-                "scaler": scaler.state_dict() if scaler is not None else None,
-                "history": history_rows,
-                "trainable_counts": trainable_counts,
-                "transformer_mode": transformer_mode,
-                "val_metrics": val_metrics.as_row() if val_metrics is not None else None,
-            },
-            target_dir / "train_state.pt",
-        )
+            max_train_steps = int(max_train_steps)
+            epochs = int(math.ceil(max_train_steps / float(updates_per_epoch)))
 
-    try:
+        lr_scheduler = _build_lr_scheduler(optimizer, train_cfg, total_steps=max_train_steps)
+        scaler = torch.cuda.amp.GradScaler(enabled=(amp_dtype == torch.float16 and device.type == "cuda"))
+        if not (amp_dtype == torch.float16 and device.type == "cuda"):
+            scaler = None
+
+        transformer_train_module = transformer
+        if dist_context.use_ddp and train_transformer:
+            from torch.nn.parallel import DistributedDataParallel as DDP
+
+            ddp_kwargs = dict(
+                find_unused_parameters=bool(distributed_cfg.get("find_unused_parameters", False)),
+                broadcast_buffers=bool(distributed_cfg.get("broadcast_buffers", False)),
+            )
+            if device.type == "cuda":
+                ddp_kwargs.update(device_ids=[dist_context.local_rank], output_device=dist_context.local_rank)
+            transformer_train_module = DDP(transformer, **ddp_kwargs)
+
+        start_epoch = 0
+        global_step = 0
+        best_val = math.inf
+        history_rows: list[dict[str, Any]] = []
+        if resume_state is not None:
+            try:
+                optimizer.load_state_dict(resume_state.get("optimizer", {}))
+            except Exception as e:
+                if dist_context.is_main_process:
+                    print(f"[warn] failed to load optimizer state: {e}", flush=True)
+            if lr_scheduler is not None and resume_state.get("scheduler", None) is not None:
+                try:
+                    lr_scheduler.load_state_dict(resume_state["scheduler"])
+                except Exception as e:
+                    if dist_context.is_main_process:
+                        print(f"[warn] failed to load lr scheduler state: {e}", flush=True)
+            if scaler is not None and resume_state.get("scaler", None) is not None:
+                try:
+                    scaler.load_state_dict(resume_state["scaler"])
+                except Exception as e:
+                    if dist_context.is_main_process:
+                        print(f"[warn] failed to load scaler state: {e}", flush=True)
+            start_epoch = int(resume_state.get("epoch", 0))
+            global_step = int(resume_state.get("global_step", 0))
+            best_val = float(resume_state.get("best_val_total_loss", math.inf))
+            history_rows = list(resume_state.get("history", [])) if isinstance(resume_state.get("history", []), list) else []
+
+        wandb_session = init_wandb_session(
+            cfg,
+            out_dir=out_dir,
+            experiment_name=exp_name,
+            default_project="sd35-system-finetune",
+            enabled=dist_context.is_main_process,
+        )
+        wandb_session.set_summary("transformer_mode", transformer_mode)
+        wandb_session.set_summary("train_transformer_params", trainable_counts["transformer"])
+        wandb_session.set_summary("train_vae_params", trainable_counts["vae"])
+        wandb_session.set_summary("num_train_samples", len(train_ds))
+        wandb_session.set_summary("num_val_samples", len(val_ds))
+        wandb_session.set_summary("world_size", dist_context.world_size)
+        wandb_session.set_summary("use_ddp", dist_context.use_ddp)
+        wandb_session.set_summary("per_gpu_batch_size", batch_size)
+        wandb_session.set_summary("effective_batch_size", batch_size * grad_accum_steps * dist_context.world_size)
+
+        step_log_interval = int((cfg.get("wandb", {}) or {}).get("log_interval_steps", train_cfg.get("log_interval_steps", 0)))
+        save_every_n_steps = int(train_cfg.get("checkpoint_interval_steps", 0))
+        save_total_limit = int(train_cfg.get("checkpoint_total_limit", train_cfg.get("save_total_limit", 3)))
+        num_val_batches = train_cfg.get("num_val_batches", None)
+        if num_val_batches is not None:
+            num_val_batches = int(num_val_batches)
+        local_num_val_batches = None
+        if num_val_batches is not None:
+            local_num_val_batches = int(math.ceil(num_val_batches / float(dist_context.world_size))) if dist_context.use_ddp else num_val_batches
+
+        use_pbar = bool(train_cfg.get("progress_bar", True)) and (tqdm is not None)
+        pbar_mininterval = float(train_cfg.get("tqdm_mininterval", 0.5))
+        pbar_update_interval = int(train_cfg.get("tqdm_update_interval", 10))
+        pbar_leave = bool(train_cfg.get("tqdm_leave", False))
+
+        best_epoch = int(resume_state.get("best_epoch", -1)) if resume_state is not None else -1
+
+        def _save_checkpoint(target_dir: Path, epoch_idx: int, step_idx: int, val_metrics: EpochMetrics | None) -> None:
+            if not dist_context.is_main_process:
+                return
+            target_dir.mkdir(parents=True, exist_ok=True)
+            if transformer_mode == "lora":
+                _save_lora_weights(pipe, transformer, target_dir / "lora")
+            else:
+                transformer.save_pretrained(target_dir / "transformer")
+            if train_vae or bool(target_vae_cfg.get("save_even_if_frozen", False)):
+                vae.save_pretrained(target_dir / "vae")
+            torch.save(
+                {
+                    "epoch": epoch_idx,
+                    "global_step": step_idx,
+                    "best_val_total_loss": best_val,
+                    "best_epoch": best_epoch,
+                    "optimizer": optimizer.state_dict(),
+                    "scheduler": lr_scheduler.state_dict() if lr_scheduler is not None else None,
+                    "scaler": scaler.state_dict() if scaler is not None else None,
+                    "history": history_rows,
+                    "trainable_counts": trainable_counts,
+                    "transformer_mode": transformer_mode,
+                    "val_metrics": val_metrics.as_row() if val_metrics is not None else None,
+                },
+                target_dir / "train_state.pt",
+            )
+
         for epoch in range(start_epoch + 1, epochs + 1):
             if global_step >= max_train_steps:
                 break
+
+            if train_sampler is not None:
+                train_sampler.set_epoch(epoch)
 
             remaining_updates = max(0, max_train_steps - global_step)
             if remaining_updates == 0:
@@ -1195,7 +1411,7 @@ def train_sd35_system_from_config(cfg: dict[str, Any], config_path: str | Path) 
 
             train_metrics, global_step = _run_epoch(
                 pipe=pipe,
-                transformer=transformer,
+                transformer=transformer_train_module,
                 vae=vae,
                 teacher=teacher,
                 prompt_manager=prompt_manager,
@@ -1225,12 +1441,20 @@ def train_sd35_system_from_config(cfg: dict[str, Any], config_path: str | Path) 
                 max_batches=train_max_batches,
                 vae_diffusion_gradients=vae_diffusion_gradients,
                 max_grad_norm=float(train_cfg.get("gradient_clip_norm", diffusion_cfg.get("max_grad_norm", objective_cfg.get("max_grad_norm", 0.0) or 0.0))),
+                use_progress_bar=use_pbar,
+                progress_desc=f"Train {epoch}/{epochs}",
+                progress_update_interval=pbar_update_interval,
+                progress_mininterval=pbar_mininterval,
+                progress_leave=pbar_leave,
+                is_main_process=dist_context.is_main_process,
+                use_distributed=dist_context.use_ddp,
+                ddp_no_sync_module=(transformer_train_module if dist_context.use_ddp and train_transformer else None),
             )
 
             with torch.no_grad():
                 val_metrics, _ = _run_epoch(
                     pipe=pipe,
-                    transformer=transformer,
+                    transformer=transformer_train_module,
                     vae=vae,
                     teacher=teacher,
                     prompt_manager=prompt_manager,
@@ -1257,93 +1481,109 @@ def train_sd35_system_from_config(cfg: dict[str, Any], config_path: str | Path) 
                     global_step_start=global_step,
                     wandb_session=wandb_session,
                     step_log_interval=0,
-                    max_batches=num_val_batches,
+                    max_batches=local_num_val_batches,
                     vae_diffusion_gradients=False,
                     max_grad_norm=0.0,
+                    use_progress_bar=use_pbar,
+                    progress_desc=f"Val   {epoch}/{epochs}",
+                    progress_update_interval=pbar_update_interval,
+                    progress_mininterval=pbar_mininterval,
+                    progress_leave=pbar_leave,
+                    is_main_process=dist_context.is_main_process,
+                    use_distributed=dist_context.use_ddp,
+                    ddp_no_sync_module=None,
                 )
 
-            history_rows.extend([train_metrics.as_row(), val_metrics.as_row()])
-            write_csv(history_rows, out_dir / "history.csv")
+            if dist_context.is_main_process:
+                history_rows.extend([train_metrics.as_row(), val_metrics.as_row()])
+                write_csv(history_rows, out_dir / "history.csv")
 
-            preview_payload: dict[str, Any] = {}
-            if train_vae and bool(preview_cfg.get("enabled", True)) and str(preview_cfg.get("kind", "vae_reconstruction")).lower() == "vae_reconstruction":
-                preview_batch = next(iter(val_loader))
-                preview_images = preview_batch[0].to(device=device, dtype=torch.float32)
-                recon = _build_preview_recon(vae, preview_images, posterior_mode=posterior_mode)
-                preview_path = _save_recon_preview(out_dir / "previews" / f"epoch_{epoch:03d}_recon.png", preview_images, recon)
-                wb_img = maybe_build_wandb_image(wandb_session, str(preview_path), caption=f"epoch {epoch}")
-                if wb_img is not None:
-                    preview_payload["preview/reconstruction"] = wb_img
-            else:
-                preview_path = _maybe_generate_text2img_preview(pipe, preview_cfg, out_dir / "previews" / f"epoch_{epoch:03d}_text2img.png")
-                if preview_path is not None:
+                preview_payload: dict[str, Any] = {}
+                if train_vae and bool(preview_cfg.get("enabled", True)) and str(preview_cfg.get("kind", "vae_reconstruction")).lower() == "vae_reconstruction":
+                    preview_batch = next(iter(val_loader))
+                    preview_images = preview_batch[0].to(device=device, dtype=torch.float32)
+                    recon = _build_preview_recon(vae, preview_images, posterior_mode=posterior_mode)
+                    preview_path = _save_recon_preview(out_dir / "previews" / f"epoch_{epoch:03d}_recon.png", preview_images, recon)
                     wb_img = maybe_build_wandb_image(wandb_session, str(preview_path), caption=f"epoch {epoch}")
                     if wb_img is not None:
-                        preview_payload["preview/text2img"] = wb_img
+                        preview_payload["preview/reconstruction"] = wb_img
+                else:
+                    preview_path = _maybe_generate_text2img_preview(pipe, preview_cfg, out_dir / "previews" / f"epoch_{epoch:03d}_text2img.png")
+                    if preview_path is not None:
+                        wb_img = maybe_build_wandb_image(wandb_session, str(preview_path), caption=f"epoch {epoch}")
+                        if wb_img is not None:
+                            preview_payload["preview/text2img"] = wb_img
 
-            epoch_payload = {
-                "epoch": epoch,
+                epoch_payload = {
+                    "epoch": epoch,
+                    "global_step": global_step,
+                    "train/loss_epoch": train_metrics.total_loss,
+                    "train/diffusion_epoch": train_metrics.diffusion_loss,
+                    "train/vae_epoch": train_metrics.vae_loss,
+                    "train/recon_epoch": train_metrics.recon_loss,
+                    "train/kl_epoch": train_metrics.kl_loss,
+                    "train/feature_epoch": train_metrics.feature_loss,
+                    "train/logit_epoch": train_metrics.logit_loss,
+                    "train/noise_feature_epoch": train_metrics.noise_feature_loss,
+                    "val/loss": val_metrics.total_loss,
+                    "val/diffusion": val_metrics.diffusion_loss,
+                    "val/vae": val_metrics.vae_loss,
+                    "val/recon": val_metrics.recon_loss,
+                    "val/kl": val_metrics.kl_loss,
+                    "val/feature": val_metrics.feature_loss,
+                    "val/logit": val_metrics.logit_loss,
+                    "val/noise_feature": val_metrics.noise_feature_loss,
+                    "train/lr": float(optimizer.param_groups[0]["lr"]),
+                }
+                epoch_payload.update(preview_payload)
+                wandb_session.log(epoch_payload, step=global_step)
+
+                _save_checkpoint(out_dir / "last", epoch, global_step, val_metrics)
+                if save_every_n_steps > 0 and global_step > 0 and global_step % save_every_n_steps == 0:
+                    step_dir = checkpoint_root / f"step_{global_step:08d}"
+                    _save_checkpoint(step_dir, epoch, global_step, val_metrics)
+                    _prune_old_checkpoints(checkpoint_root, save_total_limit)
+
+                if val_metrics.total_loss < best_val:
+                    best_val = val_metrics.total_loss
+                    best_epoch = epoch
+                    _save_checkpoint(out_dir / "best", epoch, global_step, val_metrics)
+                    write_json(
+                        {
+                            "best_epoch": best_epoch,
+                            "best_val_total_loss": best_val,
+                            "train_metrics": train_metrics.as_row(),
+                            "val_metrics": val_metrics.as_row(),
+                        },
+                        out_dir / "best" / "metrics.json",
+                    )
+                    wandb_session.set_summary("best_epoch", best_epoch)
+                    wandb_session.set_summary("best_val_total_loss", best_val)
+
+            _barrier_if_needed(dist_context)
+
+        if dist_context.is_main_process:
+            summary = {
+                "experiment_name": exp_name,
+                "transformer_mode": transformer_mode,
+                "train_transformer": train_transformer,
+                "train_vae": train_vae,
+                "vae_diffusion_gradients": vae_diffusion_gradients,
+                "train_transformer_params": trainable_counts["transformer"],
+                "train_vae_params": trainable_counts["vae"],
+                "num_train_samples": len(train_ds),
+                "num_val_samples": len(val_ds),
+                "best_epoch": best_epoch,
+                "best_val_total_loss": best_val,
                 "global_step": global_step,
-                "train/loss_epoch": train_metrics.total_loss,
-                "train/diffusion_epoch": train_metrics.diffusion_loss,
-                "train/vae_epoch": train_metrics.vae_loss,
-                "train/recon_epoch": train_metrics.recon_loss,
-                "train/kl_epoch": train_metrics.kl_loss,
-                "train/feature_epoch": train_metrics.feature_loss,
-                "train/logit_epoch": train_metrics.logit_loss,
-                "train/noise_feature_epoch": train_metrics.noise_feature_loss,
-                "val/loss": val_metrics.total_loss,
-                "val/diffusion": val_metrics.diffusion_loss,
-                "val/vae": val_metrics.vae_loss,
-                "val/recon": val_metrics.recon_loss,
-                "val/kl": val_metrics.kl_loss,
-                "val/feature": val_metrics.feature_loss,
-                "val/logit": val_metrics.logit_loss,
-                "val/noise_feature": val_metrics.noise_feature_loss,
-                "train/lr": float(optimizer.param_groups[0]["lr"]),
+                "world_size": dist_context.world_size,
+                "effective_batch_size": batch_size * grad_accum_steps * dist_context.world_size,
             }
-            epoch_payload.update(preview_payload)
-            wandb_session.log(epoch_payload, step=global_step)
-
-            _save_checkpoint(out_dir / "last", epoch, global_step, val_metrics)
-            if save_every_n_steps > 0 and global_step > 0 and global_step % save_every_n_steps == 0:
-                step_dir = checkpoint_root / f"step_{global_step:08d}"
-                _save_checkpoint(step_dir, epoch, global_step, val_metrics)
-                _prune_old_checkpoints(checkpoint_root, save_total_limit)
-
-            if val_metrics.total_loss < best_val:
-                best_val = val_metrics.total_loss
-                best_epoch = epoch
-                _save_checkpoint(out_dir / "best", epoch, global_step, val_metrics)
-                write_json(
-                    {
-                        "best_epoch": best_epoch,
-                        "best_val_total_loss": best_val,
-                        "train_metrics": train_metrics.as_row(),
-                        "val_metrics": val_metrics.as_row(),
-                    },
-                    out_dir / "best" / "metrics.json",
-                )
-                wandb_session.set_summary("best_epoch", best_epoch)
-                wandb_session.set_summary("best_val_total_loss", best_val)
-
-        summary = {
-            "experiment_name": exp_name,
-            "transformer_mode": transformer_mode,
-            "train_transformer": train_transformer,
-            "train_vae": train_vae,
-            "vae_diffusion_gradients": vae_diffusion_gradients,
-            "train_transformer_params": trainable_counts["transformer"],
-            "train_vae_params": trainable_counts["vae"],
-            "num_train_samples": len(train_ds),
-            "num_val_samples": len(val_ds),
-            "best_epoch": best_epoch,
-            "best_val_total_loss": best_val,
-            "global_step": global_step,
-        }
-        write_json(summary, out_dir / "summary.json")
-        for key, value in summary.items():
-            wandb_session.set_summary(key, value)
+            write_json(summary, out_dir / "summary.json")
+            for key, value in summary.items():
+                wandb_session.set_summary(key, value)
         return out_dir
     finally:
-        wandb_session.finish()
+        if wandb_session is not None:
+            wandb_session.finish()
+        _cleanup_distributed(dist_context)

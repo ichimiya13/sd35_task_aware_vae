@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import os
 from pathlib import Path
 from typing import Any
 
@@ -31,7 +32,8 @@ def main() -> None:
     from src.sd35_task_aware_vae.sd3.finetune import train_sd35_system_from_config
 
     out_dir = train_sd35_system_from_config(cfg, args.config)
-    print(f"[done] SD3.5 finetuning finished: {out_dir}")
+    if int(os.environ.get("RANK", "0")) == 0:
+        print(f"[done] SD3.5 finetuning finished: {out_dir}")
 
 
 if __name__ == "__main__":
