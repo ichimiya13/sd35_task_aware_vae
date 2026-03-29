@@ -19,3 +19,4 @@ build/
 outputs/
 src/scripts/dataset_stats.py
 configs/wandb_api_key.txt
+data_samples/
