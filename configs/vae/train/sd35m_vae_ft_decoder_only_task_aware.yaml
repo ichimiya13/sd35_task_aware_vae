@@ -1,4 +1,4 @@
-experiment_name: sd35m_vae_ft_task_aware
+experiment_name: sd35m_vae_ft_decoder_only_task_aware
 seed: 42
 
 runtime:
@@ -33,8 +33,11 @@ vae:
   posterior:
     train: mode
     eval: mode
-  freeze_patterns: []
-  unfreeze_patterns: []
+  freeze_patterns:
+    - "^encoder\\."
+    - "^quant_conv\\."
+  unfreeze_patterns:
+    - "^decoder\\."
 
 teacher:
   checkpoint: "outputs/checkpoints/teacher/teacher_convnextl_proposed/best.pt"
@@ -109,6 +112,6 @@ output:
 wandb:
   enabled: true
   project: uwf-sd35
-  name: sd35m_vae_ft_task_aware
+  name: sd35m_vae_ft_decoder_only_task_aware
   mode: online
   log_interval_steps: 10

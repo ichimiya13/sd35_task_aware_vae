@@ -1,0 +1,117 @@
+experiment_name: sd35m_dit_full_ft_label_conditioned
+seed: 42
+
+runtime:
+  gpu_ids: [0]
+
+data:
+  root: "../data/uwf/multilabel/MedicalCheckup/splitted"
+  split_filename: "default_split.yaml"
+  train_split: "train"
+  val_split: "val"
+  label_schema_file: "configs/labels/proposed_schema.yaml"
+  mean: [0.485, 0.456, 0.406]
+  std: [0.229, 0.224, 0.225]
+
+image:
+  center_crop_size: 3072
+  image_size: 1024
+
+augment:
+  hflip_p: 0.5
+
+model:
+  family: sd35
+  variant: medium
+  repo_id: stabilityai/stable-diffusion-3.5-medium
+  device: cuda
+  torch_dtype: bf16
+  load_dtype: bf16
+  allow_tf32: true
+  max_sequence_length: 256
+
+prompts:
+  mode: label_conditioned
+  template_file: "configs/prompts/uwf_class_prompts_medium.yaml"
+  offload_static_text_encoders: false
+  multi_label_strategy: topk
+  max_labels_in_prompt: 2
+  label_dropout_p: 0.15
+  neutral_prompt_probability: 0.10
+
+vae:
+  backend: sd35
+  subfolder: vae
+  checkpoint: null
+  posterior: mode
+
+train_targets:
+  transformer:
+    mode: full
+    checkpoint: null
+    freeze_patterns: []
+    unfreeze_patterns: []
+    upcast_trainable_params: false
+  vae:
+    enabled: false
+    posterior: mode
+    diffusion_gradients: false
+  text_encoders:
+    enabled: false
+
+optimizer:
+  name: adamw
+  lr: 5.0e-6
+  transformer_lr: 5.0e-6
+  weight_decay: 1.0e-2
+  betas: [0.9, 0.999]
+  eps: 1.0e-8
+  use_8bit_adam: false
+
+train:
+  epochs: 10
+  max_train_steps: 10000
+  batch_size: 1
+  num_workers: 8
+  grad_accum_steps: 4
+  drop_last: true
+  mixed_precision: bf16
+  gradient_checkpointing: true
+  lr_scheduler: constant_with_warmup
+  lr_warmup_steps: 100
+  log_interval_steps: 10
+  checkpoint_interval_steps: 500
+  checkpoint_total_limit: 5
+  num_val_batches: 16
+  resume_from: null
+  progress_bar: true
+
+loss:
+  recon:
+    weight: 1.0
+    type: l1
+  kl:
+    weight: 1.0e-6
+
+objective:
+  diffusion_weight: 1.0
+  vae_weight: 1.0
+
+preview:
+  enabled: true
+  kind: text2img
+  prompt: "ultra-widefield fundus photograph showing proliferative diabetic retinopathy, realistic clinical retinal imaging"
+  negative_prompt: "cartoon, illustration, painting, text overlay, watermark"
+  num_inference_steps: 28
+  guidance_scale: 4.5
+  seed: 123
+
+output:
+  root_dir: outputs/checkpoints/sd3
+
+wandb:
+  enabled: true
+  project: uwf-sd35
+  name: sd35m_dit_full_ft_label_conditioned
+  mode: online
+  log_interval_steps: 10

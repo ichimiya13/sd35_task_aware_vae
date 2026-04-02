@@ -30,7 +30,9 @@ vae:
   use_official: true
   subfolder: vae
   checkpoint: null
-  posterior: mode
+  posterior:
+    train: mode
+    eval: mode
   freeze_patterns: []
   unfreeze_patterns: []
 
@@ -52,17 +54,54 @@ train:
   drop_last: true
 
 loss:
-  recon_type: l1
-  recon_weight: 1.0
-  kl_weight: 1.0e-6
-  feature_weight: 0.0
-  logit_weight: 0.0
-  noise_feature_weight: 0.0
+  recon:
+    weight: 1.0
+    type: l1
+    epsilon: 1.0e-3
+  kl:
+    weight: 1.0e-6
+  edge:
+    weight: 0.0
+    type: sobel_l1
+    use_weight_map: false
+  weighted_recon:
+    weight: 0.0
+    type: l1
+    epsilon: 1.0e-3
+  weight_map:
+    mode: peripheral
+    min_weight: 1.0
+    max_weight: 3.0
+    gamma: 2.0
+    inner_radius: 0.35
+    apply_retina_mask: true
+    retina_threshold: 0.03
+  feature:
+    weight: 0.0
+    type: mse
+  logit:
+    weight: 0.0
+    type: smooth_l1
+  lpips:
+    weight: 0.0
+    net: alex
+  noise_feature:
+    weight: 0.0
+    type: mse
 
 noise_conditioning:
   mode: gaussian
   min_beta: 0.02
   max_beta: 0.25
+
+latent_stats:
+  enabled: true
+  split: train
+  posterior: mode
+  max_batches: 128
+  update_config: true
+  overwrite_saved_dir: false
+  also_calibrate_last: true
 
 output:
   root_dir: outputs/checkpoints/vae

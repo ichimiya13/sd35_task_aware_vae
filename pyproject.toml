@@ -23,6 +23,7 @@ dependencies = [
   "peft>=0.12.0",
   "wandb>=0.17.0",
   "safetensors>=0.4.0",
+  "lpips>=0.1.4",
 ]
 
 [tool.setuptools]
