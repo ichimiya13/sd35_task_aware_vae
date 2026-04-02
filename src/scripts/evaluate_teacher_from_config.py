@@ -10,6 +10,7 @@ from typing import Any, Dict, List, Tuple, Optional
 import yaml
 from tqdm import tqdm
 from src.sd35_task_aware_vae.labels.schema import load_label_schema
+from src.sd35_task_aware_vae.teacher_classifier.metrics import compute_multilabel_metrics
 
 
 # -------------------------
@@ -102,7 +103,7 @@ def compute_multilabel_metrics_bin(y_true, y_pred) -> dict[str, Any]:
     }
 
 
-def per_class_table(y_true, y_pred, class_names: list[str]) -> list[dict[str, Any]]:
+def per_class_table(y_true, y_pred, class_names: list[str], y_prob=None, prob_metrics: dict[str, Any] | None = None) -> list[dict[str, Any]]:
     import numpy as np
 
     y_true = y_true.astype(np.int32)
@@ -112,6 +113,16 @@ def per_class_table(y_true, y_pred, class_names: list[str]) -> list[dict[str, An
     fp = ((y_pred == 1) & (y_true == 0)).sum(axis=0).astype(np.int64)
     fn = ((y_pred == 0) & (y_true == 1)).sum(axis=0).astype(np.int64)
     tn = ((y_pred == 0) & (y_true == 0)).sum(axis=0).astype(np.int64)
+
+    per_class_auroc = []
+    per_class_ap = []
+    if prob_metrics is not None:
+        per_class_auroc = list(prob_metrics.get("per_class_auroc", []))
+        per_class_ap = list(prob_metrics.get("per_class_ap", prob_metrics.get("per_class_auprc", [])))
+    if not per_class_auroc:
+        per_class_auroc = [None for _ in class_names]
+    if not per_class_ap:
+        per_class_ap = [None for _ in class_names]
 
     rows = []
     for i, name in enumerate(class_names):
@@ -130,8 +141,11 @@ def per_class_table(y_true, y_pred, class_names: list[str]) -> list[dict[str, An
             "precision": prec,
             "recall": rec,
             "f1": f1,
+            "auroc": per_class_auroc[i] if i < len(per_class_auroc) else None,
+            "ap": per_class_ap[i] if i < len(per_class_ap) else None,
         })
     return rows
+
 
 
 def choose_global_threshold_macro_f1(
@@ -463,6 +477,8 @@ def eval_worker(rank: int, world_size: int, cfg: dict[str, Any], config_path: st
         y_pred = (probs >= best_t).astype(np.int32)
 
         m = compute_multilabel_metrics_bin(y_true, y_pred)
+        prob_m = compute_multilabel_metrics(y_true, probs)
+        m.update(prob_m)
 
         # normal postprocess (異常なし): どれも陽性がなければ正常
         y_true_normal = (y_true.sum(axis=1) == 0).astype(np.int32)
@@ -498,8 +514,11 @@ def eval_worker(rank: int, world_size: int, cfg: dict[str, Any], config_path: st
         # print summary
         print(
             f"[{sp}] "
+            f"macro_auroc={0.0 if m.get('macro_auroc') is None else m['macro_auroc']:.4f} "
+            f"macro_ap={0.0 if m.get('macro_ap') is None else m['macro_ap']:.4f} "
             f"accuracy_label={m['accuracy_label']:.4f} "
             f"precision_macro={m['precision_macro']:.4f} precision_micro={m['precision_micro']:.4f} "
+            f"recall_macro={m['recall_macro']:.4f} recall_micro={m['recall_micro']:.4f} "
             f"f1_macro={m['f1_macro']:.4f} f1_micro={m['f1_micro']:.4f} "
             f"subset_acc={m['subset_accuracy']:.4f} "
             f"normal_f1={m['normal/f1']:.4f}",
@@ -511,7 +530,7 @@ def eval_worker(rank: int, world_size: int, cfg: dict[str, Any], config_path: st
         out_metrics_path.write_text(json.dumps(m, ensure_ascii=False, indent=2), encoding="utf-8")
 
         # per-class table
-        rows = per_class_table(y_true, y_pred, class_names)
+        rows = per_class_table(y_true, y_pred, class_names, y_prob=probs, prob_metrics=m)
         write_csv(rows, out_dir / f"per_class_{sp}.csv")
 
         # optionally save predictions
@@ -545,9 +564,13 @@ def eval_worker(rank: int, world_size: int, cfg: dict[str, Any], config_path: st
                 for sp in splits:
                     mm = all_metrics["splits"][sp]
                     wandb.log({
+                        f"{sp}/macro_auroc": mm.get("macro_auroc"),
+                        f"{sp}/macro_ap": mm.get("macro_ap"),
                         f"{sp}/accuracy_label": mm["accuracy_label"],
                         f"{sp}/precision_macro": mm["precision_macro"],
                         f"{sp}/precision_micro": mm["precision_micro"],
+                        f"{sp}/recall_macro": mm["recall_macro"],
+                        f"{sp}/recall_micro": mm["recall_micro"],
                         f"{sp}/f1_macro": mm["f1_macro"],
                         f"{sp}/f1_micro": mm["f1_micro"],
                         f"{sp}/subset_accuracy": mm["subset_accuracy"],

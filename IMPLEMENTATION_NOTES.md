@@ -70,3 +70,26 @@ python -m src.scripts.run_sd3_generate_aug_from_config \
   - `configs/sd3/train/sd35m_dit_lora_ft.yaml`
   - `configs/sd3/train/sd35m_joint_dit_vae_ft.yaml`
 - `train_vae_from_config.py` と `src/sd35_task_aware_vae/vae/trainer.py` にも wandb logging を追加
+
+## 2026-03 update: VAE loss expansion / prompt conditioning / latent-stat calibration
+
+- `vae/losses.py`
+  - edge / gradient loss (`sobel_l1`, `laplacian_l1` など)
+  - weighted reconstruction loss
+  - optional LPIPS loss
+  - `charbonnier` reconstruction
+- `vae/trainer.py`
+  - nested YAML loss config (`recon`, `kl`, `edge`, `weighted_recon`, `feature`, `logit`, `lpips`, `noise_feature`)
+  - `vae.posterior.train` / `vae.posterior.eval` をサポート
+  - latent mean/std 推定と `scaling_factor`, `shift_factor` 再設定の保存導線を追加
+- `sd3/prompts.py`
+  - `template_file` による prompt template 読み込み
+  - class-wise alias / class prompt を YAML で編集可能
+  - multi-label prompt strategy（top-k / random-one など）
+  - class-wise text2img 用 `build_class_prompt_entries()` を追加
+- `run_sd3_generate_aug_from_config.py`
+  - dataset-driven generation に加えて `prompt.mode=class_text2img` をサポート
+  - class-conditioned text2img でラベル YAML も保存可能
+- `evaluate_teacher_from_config.py`
+  - per-class CSV に `ap` / `auroc` を追加
+  - metrics JSON に macro AP / AUROC を追加

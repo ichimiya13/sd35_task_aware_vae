@@ -12,14 +12,26 @@ except Exception:  # pragma: no cover - optional dependency
 
 from src.sd35_task_aware_vae.datasets.image_dataset import MultiLabelMedicalDataset
 from src.sd35_task_aware_vae.labels.schema import load_label_schema
-from src.sd35_task_aware_vae.sd3.latent_codec import decode_from_latents, encode_to_latents
+from src.sd35_task_aware_vae.sd3.latent_codec import (
+    apply_latent_stats_to_vae_config,
+    decode_from_latents,
+    encode_to_latents,
+    estimate_latent_moments_from_loader,
+)
 from src.sd35_task_aware_vae.sd3.vae_factory import apply_freeze_patterns, build_sd3_vae
 from src.sd35_task_aware_vae.teacher_classifier import build_convnext_large
 from src.sd35_task_aware_vae.utils.config import dump_yaml
 from src.sd35_task_aware_vae.utils.files import ensure_dir, write_csv, write_json
 from src.sd35_task_aware_vae.utils.seed import seed_everything
 from src.sd35_task_aware_vae.utils.wandb import init_wandb_session, maybe_build_wandb_image
-from src.sd35_task_aware_vae.vae.losses import feature_distance, posterior_kl_loss, reconstruction_loss
+from src.sd35_task_aware_vae.vae.losses import (
+    LPIPSLoss,
+    feature_distance,
+    gradient_loss,
+    posterior_kl_loss,
+    reconstruction_loss,
+    weighted_reconstruction_loss,
+)
 
 
 @dataclass
@@ -35,8 +47,11 @@ class EpochSummary:
     total_loss: float
     recon_loss: float
     kl_loss: float
+    edge_loss: float
+    weighted_recon_loss: float
     feature_loss: float
     logit_loss: float
+    lpips_loss: float
     noise_feature_loss: float
 
     def as_row(self) -> dict[str, Any]:
@@ -46,8 +61,11 @@ class EpochSummary:
             "total_loss": self.total_loss,
             "recon_loss": self.recon_loss,
             "kl_loss": self.kl_loss,
+            "edge_loss": self.edge_loss,
+            "weighted_recon_loss": self.weighted_recon_loss,
             "feature_loss": self.feature_loss,
             "logit_loss": self.logit_loss,
+            "lpips_loss": self.lpips_loss,
             "noise_feature_loss": self.noise_feature_loss,
         }
 
@@ -135,13 +153,111 @@ def build_datasets(cfg: dict[str, Any]):
 
 
 
+def _get_nested(cfg: dict[str, Any], *keys, default=None):
+    obj: Any = cfg
+    for key in keys:
+        if not isinstance(obj, dict) or key not in obj:
+            return default
+        obj = obj[key]
+    return obj
+
+
+
+def _section(loss_cfg: dict[str, Any], name: str, *, legacy_prefix: str | None = None, default_weight: float = 0.0) -> dict[str, Any]:
+    section = dict(loss_cfg.get(name, {}) or {})
+
+    def _legacy_get(key: str, fallback=None):
+        if legacy_prefix is None:
+            return fallback
+        return loss_cfg.get(f"{legacy_prefix}_{key}", fallback)
+
+    if "weight" not in section:
+        section["weight"] = _legacy_get("weight", default_weight)
+    if "type" not in section:
+        legacy_type = _legacy_get("type", None)
+        if legacy_type is None and legacy_prefix not in {None, "kl"}:
+            legacy_type = _legacy_get("loss_type", None)
+        if legacy_type is not None:
+            section["type"] = legacy_type
+    return section
+
+
+
+def _resolve_loss_config(loss_cfg: dict[str, Any]) -> dict[str, dict[str, Any]]:
+    cfg = dict(loss_cfg or {})
+    recon = _section(cfg, "recon", legacy_prefix="recon", default_weight=float(cfg.get("recon_weight", 1.0)))
+    if "type" not in recon:
+        recon["type"] = cfg.get("recon_type", "l1")
+    recon.setdefault("epsilon", float(cfg.get("recon_epsilon", 1.0e-3)))
+
+    kl = _section(cfg, "kl", legacy_prefix="kl", default_weight=float(cfg.get("kl_weight", 1.0e-6)))
+
+    edge = _section(cfg, "edge", legacy_prefix="edge", default_weight=float(cfg.get("edge_weight", 0.0)))
+    edge.setdefault("type", cfg.get("edge_type", "sobel_l1"))
+    edge.setdefault("use_weight_map", bool(cfg.get("edge_use_weight_map", False)))
+
+    weighted_recon = _section(
+        cfg,
+        "weighted_recon",
+        legacy_prefix="weighted_recon",
+        default_weight=float(cfg.get("weighted_recon_weight", 0.0)),
+    )
+    weighted_recon.setdefault("type", cfg.get("weighted_recon_type", recon.get("type", "l1")))
+    weighted_recon.setdefault("epsilon", float(cfg.get("weighted_recon_epsilon", recon.get("epsilon", 1.0e-3))))
+
+    feature = _section(cfg, "feature", legacy_prefix="feature", default_weight=float(cfg.get("feature_weight", 0.0)))
+    feature.setdefault("type", cfg.get("feature_loss_type", "mse"))
+
+    logit = _section(cfg, "logit", legacy_prefix="logit", default_weight=float(cfg.get("logit_weight", 0.0)))
+    logit.setdefault("type", cfg.get("logit_loss_type", "mse"))
+
+    lpips = _section(cfg, "lpips", legacy_prefix="lpips", default_weight=float(cfg.get("lpips_weight", 0.0)))
+    lpips.setdefault("net", cfg.get("lpips_net", "alex"))
+    lpips.setdefault("spatial", bool(cfg.get("lpips_spatial", False)))
+
+    noise_feature = _section(
+        cfg,
+        "noise_feature",
+        legacy_prefix="noise_feature",
+        default_weight=float(cfg.get("noise_feature_weight", 0.0)),
+    )
+    noise_feature.setdefault("type", cfg.get("noise_feature_loss_type", feature.get("type", "mse")))
+
+    weight_map = dict(cfg.get("weight_map", {}) or {})
+    weight_map.setdefault("mode", str(cfg.get("weight_map_mode", "none")))
+    weight_map.setdefault("min_weight", float(cfg.get("weight_map_min_weight", 1.0)))
+    weight_map.setdefault("max_weight", float(cfg.get("weight_map_max_weight", 1.0)))
+    weight_map.setdefault("gamma", float(cfg.get("weight_map_gamma", 1.0)))
+    weight_map.setdefault("inner_radius", float(cfg.get("weight_map_inner_radius", 0.0)))
+    weight_map.setdefault("retina_threshold", float(cfg.get("weight_map_retina_threshold", 0.03)))
+    weight_map.setdefault("apply_retina_mask", bool(cfg.get("weight_map_apply_retina_mask", True)))
+
+    return {
+        "recon": recon,
+        "kl": kl,
+        "edge": edge,
+        "weighted_recon": weighted_recon,
+        "feature": feature,
+        "logit": logit,
+        "lpips": lpips,
+        "noise_feature": noise_feature,
+        "weight_map": weight_map,
+    }
+
+
+
+def _get_weight(loss_cfg: dict[str, Any], name: str) -> float:
+    resolved = _resolve_loss_config(loss_cfg)
+    return float(resolved[name].get("weight", 0.0))
+
+
+
 def build_teacher_if_needed(cfg: dict[str, Any], num_classes: int, device):
     import torch
 
     loss_cfg = cfg.get("loss", {}) or {}
     need_teacher = any(
-        float(loss_cfg.get(k, 0.0)) > 0
-        for k in ["feature_weight", "logit_weight", "noise_feature_weight"]
+        _get_weight(loss_cfg, key) > 0 for key in ["feature", "logit", "noise_feature"]
     )
     if not need_teacher:
         return None
@@ -223,6 +339,70 @@ def _sample_noisy_latents(latents, noise_cfg: dict[str, Any], generator=None):
 
 
 
+def _build_weight_map(batch, cfg: dict[str, Any] | None):
+    import torch
+
+    cfg = cfg or {}
+    mode = str(cfg.get("mode", "none")).lower()
+    if mode in {"none", "off", "disabled"}:
+        return None
+
+    if mode not in {"peripheral", "radial", "periphery"}:
+        raise ValueError(f"Unsupported weight_map.mode: {mode}")
+
+    b, _c, h, w = batch.shape
+    dtype = batch.dtype
+    device = batch.device
+    yy = torch.linspace(-1.0, 1.0, steps=h, device=device, dtype=dtype).view(h, 1).expand(h, w)
+    xx = torch.linspace(-1.0, 1.0, steps=w, device=device, dtype=dtype).view(1, w).expand(h, w)
+    rr = torch.sqrt(xx.pow(2) + yy.pow(2)) / math.sqrt(2.0)
+    rr = rr.clamp(0.0, 1.0)
+
+    inner = float(cfg.get("inner_radius", 0.0))
+    gamma = float(cfg.get("gamma", 1.0))
+    min_w = float(cfg.get("min_weight", 1.0))
+    max_w = float(cfg.get("max_weight", 1.0))
+    if inner > 0:
+        rr = ((rr - inner) / max(1.0e-6, 1.0 - inner)).clamp(0.0, 1.0)
+    if gamma != 1.0:
+        rr = rr.pow(gamma)
+
+    base = min_w + (max_w - min_w) * rr
+    weight_map = base.unsqueeze(0).unsqueeze(0).expand(b, 1, h, w).clone()
+
+    if bool(cfg.get("apply_retina_mask", True)):
+        x01 = (batch.clamp(-1.0, 1.0) + 1.0) / 2.0
+        retina = (x01.mean(dim=1, keepdim=True) > float(cfg.get("retina_threshold", 0.03))).to(dtype=dtype)
+        weight_map = 1.0 + retina * (weight_map - 1.0)
+
+    return weight_map
+
+
+
+def _resolve_posterior_modes(vae_cfg: dict[str, Any]) -> tuple[str, str]:
+    posterior_cfg = vae_cfg.get("posterior", None)
+    if isinstance(posterior_cfg, dict):
+        train_mode = str(posterior_cfg.get("train", posterior_cfg.get("mode", "mode")))
+        eval_mode = str(posterior_cfg.get("eval", posterior_cfg.get("mode", train_mode)))
+        return train_mode, eval_mode
+
+    shared = str(vae_cfg.get("posterior", "mode"))
+    train_mode = str(vae_cfg.get("posterior_train", shared))
+    eval_mode = str(vae_cfg.get("posterior_eval", shared))
+    return train_mode, eval_mode
+
+
+
+def _build_lpips_if_needed(loss_cfg: dict[str, Any], device):
+    lpips_cfg = _resolve_loss_config(loss_cfg)["lpips"]
+    if float(lpips_cfg.get("weight", 0.0)) <= 0:
+        return None
+    module = LPIPSLoss(net=str(lpips_cfg.get("net", "alex")), spatial=bool(lpips_cfg.get("spatial", False)))
+    module.to(device)
+    return module
+
+
+
 def _compute_loss_terms(
     *,
     vae,
@@ -235,11 +415,19 @@ def _compute_loss_terms(
     posterior_mode: str,
     noise_cfg: dict[str, Any],
     generator=None,
+    lpips_module=None,
 ):
     import torch
 
-    feature_kind = str(loss_cfg.get("feature_loss_type", "mse"))
-    recon_kind = str(loss_cfg.get("recon_type", "l1"))
+    resolved = _resolve_loss_config(loss_cfg)
+    feature_cfg = resolved["feature"]
+    logit_cfg = resolved["logit"]
+    recon_cfg = resolved["recon"]
+    edge_cfg = resolved["edge"]
+    weighted_recon_cfg = resolved["weighted_recon"]
+    lpips_cfg = resolved["lpips"]
+    noise_feature_cfg = resolved["noise_feature"]
+    weight_map_cfg = resolved["weight_map"]
     feature_stage = teacher_cfg.get("feature_stage", "embedding")
 
     latents, posterior = encode_to_latents(
@@ -251,11 +439,50 @@ def _compute_loss_terms(
     )
     recon = decode_from_latents(vae, latents)
 
-    recon_loss_value = reconstruction_loss(recon, batch, kind=recon_kind)
+    weight_map = None
+    if float(weighted_recon_cfg.get("weight", 0.0)) > 0 or (
+        float(edge_cfg.get("weight", 0.0)) > 0 and bool(edge_cfg.get("use_weight_map", False))
+    ):
+        weight_map = _build_weight_map(batch, weight_map_cfg)
+
+    recon_loss_value = reconstruction_loss(
+        recon,
+        batch,
+        kind=str(recon_cfg.get("type", "l1")),
+        reduction="mean",
+        epsilon=float(recon_cfg.get("epsilon", 1.0e-3)),
+    )
     kl_loss_value = posterior_kl_loss(posterior)
+    edge_loss_value = batch.new_tensor(0.0)
+    weighted_recon_loss_value = batch.new_tensor(0.0)
     feature_loss_value = batch.new_tensor(0.0)
     logit_loss_value = batch.new_tensor(0.0)
+    lpips_loss_value = batch.new_tensor(0.0)
     noise_feature_loss_value = batch.new_tensor(0.0)
+
+    if float(edge_cfg.get("weight", 0.0)) > 0:
+        edge_loss_value = gradient_loss(
+            recon,
+            batch,
+            kind=str(edge_cfg.get("type", "sobel_l1")),
+            weight_map=(weight_map if bool(edge_cfg.get("use_weight_map", False)) else None),
+        )
+
+    if float(weighted_recon_cfg.get("weight", 0.0)) > 0:
+        if weight_map is None:
+            raise ValueError("weighted_recon.weight > 0 requires loss.weight_map.mode != 'none'")
+        weighted_recon_loss_value = weighted_reconstruction_loss(
+            recon,
+            batch,
+            weight_map=weight_map,
+            kind=str(weighted_recon_cfg.get("type", recon_cfg.get("type", "l1"))),
+            epsilon=float(weighted_recon_cfg.get("epsilon", recon_cfg.get("epsilon", 1.0e-3))),
+        )
+
+    if float(lpips_cfg.get("weight", 0.0)) > 0:
+        if lpips_module is None:
+            raise RuntimeError("LPIPS loss is enabled but lpips_module was not initialized")
+        lpips_loss_value = lpips_module(recon, batch)
 
     if teacher is not None:
         with torch.no_grad():
@@ -265,13 +492,13 @@ def _compute_loss_terms(
         recon_teacher = normalize_for_teacher(recon, mean, std)
         recon_views = _extract_teacher_views(teacher, recon_teacher, feature_stage=feature_stage)
 
-        if float(loss_cfg.get("feature_weight", 0.0)) > 0 and target_views.features is not None and recon_views.features is not None:
-            feature_loss_value = feature_distance(recon_views.features, target_views.features, kind=feature_kind)
+        if float(feature_cfg.get("weight", 0.0)) > 0 and target_views.features is not None and recon_views.features is not None:
+            feature_loss_value = feature_distance(recon_views.features, target_views.features, kind=str(feature_cfg.get("type", "mse")))
 
-        if float(loss_cfg.get("logit_weight", 0.0)) > 0 and target_views.logits is not None and recon_views.logits is not None:
-            logit_loss_value = feature_distance(recon_views.logits, target_views.logits, kind=str(loss_cfg.get("logit_loss_type", "mse")))
+        if float(logit_cfg.get("weight", 0.0)) > 0 and target_views.logits is not None and recon_views.logits is not None:
+            logit_loss_value = feature_distance(recon_views.logits, target_views.logits, kind=str(logit_cfg.get("type", "mse")))
 
-        if float(loss_cfg.get("noise_feature_weight", 0.0)) > 0:
+        if float(noise_feature_cfg.get("weight", 0.0)) > 0:
             noisy_latents = _sample_noisy_latents(latents, noise_cfg, generator=generator)
             recon_noise = decode_from_latents(vae, noisy_latents)
             recon_noise_teacher = normalize_for_teacher(recon_noise, mean, std)
@@ -280,29 +507,38 @@ def _compute_loss_terms(
                 noise_feature_loss_value = feature_distance(
                     recon_noise_views.features,
                     target_views.features,
-                    kind=str(loss_cfg.get("noise_feature_loss_type", feature_kind)),
+                    kind=str(noise_feature_cfg.get("type", feature_cfg.get("type", "mse"))),
                 )
 
     weights = {
-        "recon": float(loss_cfg.get("recon_weight", 1.0)),
-        "kl": float(loss_cfg.get("kl_weight", 1.0e-6)),
-        "feature": float(loss_cfg.get("feature_weight", 0.0)),
-        "logit": float(loss_cfg.get("logit_weight", 0.0)),
-        "noise_feature": float(loss_cfg.get("noise_feature_weight", 0.0)),
+        "recon": float(recon_cfg.get("weight", 1.0)),
+        "kl": float(resolved["kl"].get("weight", 1.0e-6)),
+        "edge": float(edge_cfg.get("weight", 0.0)),
+        "weighted_recon": float(weighted_recon_cfg.get("weight", 0.0)),
+        "feature": float(feature_cfg.get("weight", 0.0)),
+        "logit": float(logit_cfg.get("weight", 0.0)),
+        "lpips": float(lpips_cfg.get("weight", 0.0)),
+        "noise_feature": float(noise_feature_cfg.get("weight", 0.0)),
     }
     total = (
         weights["recon"] * recon_loss_value
         + weights["kl"] * kl_loss_value
+        + weights["edge"] * edge_loss_value
+        + weights["weighted_recon"] * weighted_recon_loss_value
         + weights["feature"] * feature_loss_value
         + weights["logit"] * logit_loss_value
+        + weights["lpips"] * lpips_loss_value
         + weights["noise_feature"] * noise_feature_loss_value
     )
     return {
         "total": total,
         "recon": recon_loss_value,
         "kl": kl_loss_value,
+        "edge": edge_loss_value,
+        "weighted_recon": weighted_recon_loss_value,
         "feature": feature_loss_value,
         "logit": logit_loss_value,
+        "lpips": lpips_loss_value,
         "noise_feature": noise_feature_loss_value,
         "recon_image": recon,
     }
@@ -336,6 +572,7 @@ def _run_epoch(
     progress_update_interval: int = 10,
     progress_mininterval: float = 0.5,
     progress_leave: bool = False,
+    lpips_module=None,
 ):
     import torch
     from torchvision.utils import save_image
@@ -345,7 +582,7 @@ def _run_epoch(
     if train:
         optimizer.zero_grad(set_to_none=True)
 
-    total = recon = kl = feat = logit = noise_feat = 0.0
+    total = recon = kl = edge = weighted_recon = feat = logit = lpips_val = noise_feat = 0.0
     num_batches = 0
     num_items = 0.0
     optimizer_step = int(global_step_start)
@@ -379,8 +616,11 @@ def _run_epoch(
             "train/lr": float(optimizer.param_groups[0]["lr"]),
             "train/recon_step": float(terms["recon"].detach().cpu()),
             "train/kl_step": float(terms["kl"].detach().cpu()),
+            "train/edge_step": float(terms["edge"].detach().cpu()),
+            "train/weighted_recon_step": float(terms["weighted_recon"].detach().cpu()),
             "train/feature_step": float(terms["feature"].detach().cpu()),
             "train/logit_step": float(terms["logit"].detach().cpu()),
+            "train/lpips_step": float(terms["lpips"].detach().cpu()),
             "train/noise_feature_step": float(terms["noise_feature"].detach().cpu()),
         }
         try:
@@ -407,6 +647,7 @@ def _run_epoch(
                     teacher_cfg=teacher_cfg,
                     posterior_mode=posterior_mode,
                     noise_cfg=noise_cfg,
+                    lpips_module=lpips_module,
                 )
                 loss = terms["total"] / max(1, grad_accum_steps)
 
@@ -428,8 +669,11 @@ def _run_epoch(
         total += float(terms["total"].detach().cpu()) * batch_items
         recon += float(terms["recon"].detach().cpu()) * batch_items
         kl += float(terms["kl"].detach().cpu()) * batch_items
+        edge += float(terms["edge"].detach().cpu()) * batch_items
+        weighted_recon += float(terms["weighted_recon"].detach().cpu()) * batch_items
         feat += float(terms["feature"].detach().cpu()) * batch_items
         logit += float(terms["logit"].detach().cpu()) * batch_items
+        lpips_val += float(terms["lpips"].detach().cpu()) * batch_items
         noise_feat += float(terms["noise_feature"].detach().cpu()) * batch_items
         num_batches += 1
         num_items += batch_items
@@ -465,11 +709,78 @@ def _run_epoch(
         total_loss=total / denom,
         recon_loss=recon / denom,
         kl_loss=kl / denom,
+        edge_loss=edge / denom,
+        weighted_recon_loss=weighted_recon / denom,
         feature_loss=feat / denom,
         logit_loss=logit / denom,
+        lpips_loss=lpips_val / denom,
         noise_feature_loss=noise_feat / denom,
     )
     return summary, optimizer_step
+
+
+
+def _save_vae_checkpoint(vae, path: Path) -> None:
+    path.mkdir(parents=True, exist_ok=True)
+    vae.save_pretrained(path)
+
+
+
+def _estimate_and_save_latent_stats(
+    *,
+    cfg: dict[str, Any],
+    source_dir: Path,
+    out_dir: Path,
+    split_name: str,
+    loader,
+    model_cfg: dict[str, Any],
+    vae_cfg: dict[str, Any],
+    device,
+):
+    import torch
+
+    latent_cfg = cfg.get("latent_stats", {}) or {}
+    if not bool(latent_cfg.get("enabled", False)):
+        return None
+
+    sample_mode = str(latent_cfg.get("posterior", latent_cfg.get("sample_mode", vae_cfg.get("posterior_eval", vae_cfg.get("posterior", "mode")))))
+    max_batches = latent_cfg.get("max_batches", None)
+    max_batches = None if max_batches in {None, "", 0, "0"} else int(max_batches)
+
+    local_vae_cfg = dict(vae_cfg)
+    local_vae_cfg["checkpoint"] = str(source_dir)
+    vae = build_sd3_vae(model_cfg, local_vae_cfg, torch_dtype=torch.float32, device=device)
+    stats = estimate_latent_moments_from_loader(
+        vae,
+        loader,
+        device=device,
+        sample_mode=sample_mode,
+        max_batches=max_batches,
+    )
+
+    apply_update = bool(latent_cfg.get("update_config", True))
+    overwrite_source = bool(latent_cfg.get("overwrite_saved_dir", False))
+    if apply_update:
+        apply_latent_stats_to_vae_config(
+            vae,
+            shift=float(stats["recommended_shift_factor"]),
+            scaling=float(stats["recommended_scaling_factor"]),
+        )
+
+    stats_path = out_dir / f"latent_stats_{split_name}.json"
+    write_json(stats, stats_path)
+
+    target_dir = source_dir if overwrite_source else (out_dir / f"{source_dir.name}_latent_calibrated")
+    target_dir.mkdir(parents=True, exist_ok=True)
+    if apply_update:
+        vae.save_pretrained(target_dir)
+    write_json(stats, target_dir / "latent_stats.json")
+    return {
+        "stats": stats,
+        "stats_path": str(stats_path),
+        "vae_dir": str(target_dir),
+        "source": str(source_dir),
+    }
 
 
 
@@ -564,11 +875,13 @@ def train_sd35_vae_from_config(cfg: dict[str, Any], config_path: str | Path) -> 
 
     teacher = build_teacher_if_needed(cfg, num_classes=num_classes, device=device)
     mean, std = _teacher_stats(cfg)
-    posterior_mode = str(vae_cfg.get("posterior", "mode"))
+    posterior_train_mode, posterior_eval_mode = _resolve_posterior_modes(vae_cfg)
 
     scaler = torch.cuda.amp.GradScaler(enabled=(amp_dtype == torch.float16 and device.type == "cuda"))
     if not (amp_dtype == torch.float16 and device.type == "cuda"):
         scaler = None
+
+    lpips_module = _build_lpips_if_needed(loss_cfg, device)
 
     wandb_session = init_wandb_session(
         cfg,
@@ -581,6 +894,8 @@ def train_sd35_vae_from_config(cfg: dict[str, Any], config_path: str | Path) -> 
     wandb_session.set_summary("num_train_samples", len(train_ds))
     wandb_session.set_summary("num_val_samples", len(val_ds))
     wandb_session.set_summary("trainable_params", int(sum(p.numel() for p in trainable)))
+    wandb_session.set_summary("posterior_train_mode", posterior_train_mode)
+    wandb_session.set_summary("posterior_eval_mode", posterior_eval_mode)
 
     history_rows: list[dict[str, Any]] = []
     best_val = math.inf
@@ -608,7 +923,7 @@ def train_sd35_vae_from_config(cfg: dict[str, Any], config_path: str | Path) -> 
                 std=std,
                 loss_cfg=loss_cfg,
                 teacher_cfg=teacher_cfg,
-                posterior_mode=posterior_mode,
+                posterior_mode=posterior_train_mode,
                 noise_cfg=noise_cfg,
                 grad_accum_steps=grad_accum_steps,
                 epoch=epoch,
@@ -621,6 +936,7 @@ def train_sd35_vae_from_config(cfg: dict[str, Any], config_path: str | Path) -> 
                 progress_update_interval=pbar_update_interval,
                 progress_mininterval=pbar_mininterval,
                 progress_leave=pbar_leave,
+                lpips_module=lpips_module,
             )
             with torch.no_grad():
                 val_summary, _ = _run_epoch(
@@ -636,7 +952,7 @@ def train_sd35_vae_from_config(cfg: dict[str, Any], config_path: str | Path) -> 
                     std=std,
                     loss_cfg=loss_cfg,
                     teacher_cfg=teacher_cfg,
-                    posterior_mode=posterior_mode,
+                    posterior_mode=posterior_eval_mode,
                     noise_cfg=noise_cfg,
                     grad_accum_steps=grad_accum_steps,
                     epoch=epoch,
@@ -646,12 +962,13 @@ def train_sd35_vae_from_config(cfg: dict[str, Any], config_path: str | Path) -> 
                     progress_update_interval=pbar_update_interval,
                     progress_mininterval=pbar_mininterval,
                     progress_leave=pbar_leave,
+                    lpips_module=lpips_module,
                 )
 
             history_rows.extend([train_summary.as_row(), val_summary.as_row()])
             write_csv(history_rows, out_dir / "history.csv")
 
-            vae.save_pretrained(out_dir / "last" / "vae")
+            _save_vae_checkpoint(vae, out_dir / "last" / "vae")
             torch.save(
                 {
                     "epoch": epoch,
@@ -670,14 +987,20 @@ def train_sd35_vae_from_config(cfg: dict[str, Any], config_path: str | Path) -> 
                 "train/loss_epoch": train_summary.total_loss,
                 "train/recon_epoch": train_summary.recon_loss,
                 "train/kl_epoch": train_summary.kl_loss,
+                "train/edge_epoch": train_summary.edge_loss,
+                "train/weighted_recon_epoch": train_summary.weighted_recon_loss,
                 "train/feature_epoch": train_summary.feature_loss,
                 "train/logit_epoch": train_summary.logit_loss,
+                "train/lpips_epoch": train_summary.lpips_loss,
                 "train/noise_feature_epoch": train_summary.noise_feature_loss,
                 "val/loss": val_summary.total_loss,
                 "val/recon": val_summary.recon_loss,
                 "val/kl": val_summary.kl_loss,
+                "val/edge": val_summary.edge_loss,
+                "val/weighted_recon": val_summary.weighted_recon_loss,
                 "val/feature": val_summary.feature_loss,
                 "val/logit": val_summary.logit_loss,
+                "val/lpips": val_summary.lpips_loss,
                 "val/noise_feature": val_summary.noise_feature_loss,
                 "train/lr": float(optimizer.param_groups[0]["lr"]),
             }
@@ -690,7 +1013,7 @@ def train_sd35_vae_from_config(cfg: dict[str, Any], config_path: str | Path) -> 
             if val_summary.total_loss < best_val:
                 best_val = val_summary.total_loss
                 best_epoch = epoch
-                vae.save_pretrained(out_dir / "best" / "vae")
+                _save_vae_checkpoint(vae, out_dir / "best" / "vae")
                 write_json(
                     {
                         "best_epoch": best_epoch,
@@ -716,7 +1039,39 @@ def train_sd35_vae_from_config(cfg: dict[str, Any], config_path: str | Path) -> 
             "trainable_params": int(sum(p.numel() for p in trainable)),
             "total_params": int(sum(p.numel() for p in vae.parameters())),
             "global_step": global_step,
+            "posterior_train_mode": posterior_train_mode,
+            "posterior_eval_mode": posterior_eval_mode,
         }
+
+        latent_results = {}
+        latent_cfg = cfg.get("latent_stats", {}) or {}
+        if bool(latent_cfg.get("enabled", False)):
+            split = str(latent_cfg.get("split", "train")).lower()
+            loader = train_loader if split == "train" else val_loader
+            if (out_dir / "best" / "vae").is_dir():
+                latent_results["best"] = _estimate_and_save_latent_stats(
+                    cfg=cfg,
+                    source_dir=out_dir / "best" / "vae",
+                    out_dir=out_dir / "best",
+                    split_name=split,
+                    loader=loader,
+                    model_cfg=model_cfg,
+                    vae_cfg=vae_cfg,
+                    device=device,
+                )
+            if bool(latent_cfg.get("also_calibrate_last", True)) and (out_dir / "last" / "vae").is_dir():
+                latent_results["last"] = _estimate_and_save_latent_stats(
+                    cfg=cfg,
+                    source_dir=out_dir / "last" / "vae",
+                    out_dir=out_dir / "last",
+                    split_name=split,
+                    loader=loader,
+                    model_cfg=model_cfg,
+                    vae_cfg=vae_cfg,
+                    device=device,
+                )
+            summary["latent_stats"] = latent_results
+
         write_json(summary, out_dir / "summary.json")
         for key, value in summary.items():
             wandb_session.set_summary(key, value)

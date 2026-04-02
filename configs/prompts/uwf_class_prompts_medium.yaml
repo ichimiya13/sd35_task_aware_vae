@@ -1,0 +1,94 @@
+mode: label_conditioned
+neutral_prompt: "ultra-widefield fundus photograph, clinical retinal imaging, medically faithful, realistic retinal vessel anatomy"
+negative_prompt: "cartoon, illustration, painting, text overlay, watermark, duplicated vessels, malformed optic disc, synthetic-looking artifacts"
+label_prompt_prefix: "ultra-widefield fundus photograph showing "
+label_prompt_suffix: ", realistic clinical retinal imaging"
+label_prompt_none: "no clearly visible retinal abnormality"
+label_separator: ", "
+label_threshold: 0.5
+multi_label_strategy: topk
+max_labels_in_prompt: 2
+label_dropout_p: 0.15
+neutral_prompt_probability: 0.10
+empty_prompt_probability: 0.0
+exclude_labels_in_prompt: ["術後", "PC後"]
+label_priority:
+  - "PDR"
+  - "RRD"
+  - "DME"
+  - "糖尿病網膜症"
+  - "CSC"
+  - "黄斑変性"
+  - "ERM"
+  - "網膜静脈分枝閉塞"
+  - "網膜中心静脈閉塞"
+  - "緑内障(gla)"
+  - "視神経乳頭陥凹拡大"
+label_aliases:
+  "白内障": "cataract"
+  "硝子体混濁": "vitreous opacity"
+  "星状硝子体症": "asteroid hyalosis"
+  "VH": "vitreous hemorrhage"
+  "MH": "macular hole"
+  "分層黄斑円孔": "lamellar macular hole"
+  "黄斑偽円孔": "macular pseudohole"
+  "網膜円孔": "retinal hole"
+  "網膜萎縮性円孔": "atrophic retinal hole"
+  "網膜裂孔": "retinal tear"
+  "lattice": "lattice degeneration"
+  "RRD": "rhegmatogenous retinal detachment"
+  "黄斑変性": "macular degeneration"
+  "ドルーゼン(drusen)": "drusen"
+  "CSC": "central serous chorioretinopathy"
+  "糖尿病網膜症": "diabetic retinopathy"
+  "PDR": "proliferative diabetic retinopathy"
+  "DME": "diabetic macular edema"
+  "網膜静脈分枝閉塞": "branch retinal vein occlusion"
+  "網膜中心静脈閉塞": "central retinal vein occlusion"
+  "眼底出血": "retinal hemorrhage"
+  "網膜変性": "retinal degeneration"
+  "網膜色素変性": "retinitis pigmentosa"
+  "網脈絡膜変性": "chorioretinal degeneration"
+  "網脈絡膜萎縮": "chorioretinal atrophy"
+  "強度近視眼底": "pathologic myopic fundus"
+  "コーヌス": "peripapillary conus"
+  "ERM": "epiretinal membrane"
+  "緑内障(gla)": "glaucoma"
+  "視神経乳頭陥凹拡大": "optic disc cupping"
+  "uveitis": "uveitis"
+  "サルコイドーシス": "ocular sarcoidosis"
+  "眼内悪性リンパ腫": "intraocular malignant lymphoma"
+  "硬性白斑": "hard exudates"
+  "有髄神経線維": "myelinated nerve fibers"
+  "術後": "postoperative change"
+  "PC後": "post photocoagulation"
+  "S1": "S1 diabetic retinopathy finding"
+  "H1": "H1 diabetic retinopathy finding"
+  "S2plus": "S2 or higher diabetic retinopathy finding"
+  "H2plus": "H2 or higher diabetic retinopathy finding"
+  "NPDR": "nonproliferative diabetic retinopathy"
+class_prompts:
+  "PDR":
+    - "proliferative diabetic retinopathy with neovascularization"
+    - "advanced proliferative diabetic retinopathy"
+  "RRD":
+    - "rhegmatogenous retinal detachment"
+    - "retinal detachment with elevated detached retina"
+  "DME":
+    - "diabetic macular edema"
+    - "macular edema related to diabetic retinopathy"
+  "ERM":
+    - "epiretinal membrane over the macula"
+  "CSC":
+    - "central serous chorioretinopathy"
+  "糖尿病網膜症":
+    - "diabetic retinopathy with retinal hemorrhages and microvascular changes"
+  "網膜静脈分枝閉塞":
+    - "branch retinal vein occlusion"
+  "網膜中心静脈閉塞":
+    - "central retinal vein occlusion"
+  "黄斑変性":
+    - "macular degeneration"
+  "緑内障(gla)":
+    - "glaucomatous optic disc change"
+class_targets: "__all__"

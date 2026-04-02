@@ -1,0 +1,68 @@
+experiment_name: sd35m_generate_class_text2img_official_vae
+seed: 42
+
+runtime:
+  gpu_ids: [0]
+
+data:
+  root: "../data/uwf/multilabel/MedicalCheckup/splitted"
+  split_filename: "default_split.yaml"
+  label_schema_file: "configs/labels/proposed_schema.yaml"
+  mean: [0.485, 0.456, 0.406]
+  std: [0.229, 0.224, 0.225]
+
+image:
+  center_crop_size: 3072
+  image_size: 1024
+
+teacher:
+  checkpoint: "outputs/checkpoints/teacher/teacher_convnextl_proposed/best.pt"
+  imagenet_pretrained: true
+
+model:
+  family: sd35
+  variant: medium
+  repo_id: stabilityai/stable-diffusion-3.5-medium
+  device: cuda
+  torch_dtype: bf16
+  enable_cpu_offload: false
+  allow_tf32: true
+  num_inference_steps: 40
+  guidance_scale: 4.5
+
+transformer:
+  checkpoint: null
+  lora_path: null
+
+vae:
+  backend: sd35
+  use_official: true
+  subfolder: vae
+  checkpoint: null
+
+prompt:
+  mode: class_text2img
+  template_file: "configs/prompts/uwf_class_prompts_medium.yaml"
+  class_targets:
+    - "PDR"
+    - "DME"
+    - "RRD"
+    - ["PDR", "DME"]
+
+generation:
+  mode: text2img
+  batch_size: 2
+  num_images_per_class: 8
+  filename_pattern: "{target_id}__{idx:04d}{suffix}"
+
+filter:
+  enabled: true
+  use_target_labels: true
+  min_match_score: 0.35
+  min_max_probability: 0.10
+
+output:
+  root_dir: outputs/aug/sd3
+  copy_labels: true
+  write_split_yaml: true
+  split_name: sd35m_class_text2img_generated
