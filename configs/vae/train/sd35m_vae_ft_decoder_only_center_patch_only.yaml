@@ -1,4 +1,4 @@
-experiment_name: sd35m_vae_ft_decoder_only_base
+experiment_name: sd35m_vae_ft_decoder_only_center_patch_only
 seed: 42
 runtime:
   gpu_ids:
@@ -71,10 +71,10 @@ loss:
     type: l1
     epsilon: 0.001
   patch_recon:
-    weight: 0.0
-    type: l1
+    weight: 0.2
+    type: charbonnier
     epsilon: 0.001
-    crop_ratio: 0.5
+    crop_ratio: 0.45
     center_x: 0.5
     center_y: 0.5
   weight_map:
@@ -114,6 +114,6 @@ output:
 wandb:
   enabled: true
   project: uwf-sd35
-  name: sd35m_vae_ft_decoder_only_base
+  name: sd35m_vae_ft_decoder_only_center_patch_only
   mode: online
   log_interval_steps: 10

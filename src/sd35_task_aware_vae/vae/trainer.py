@@ -28,6 +28,7 @@ from src.sd35_task_aware_vae.vae.losses import (
     LPIPSLoss,
     feature_distance,
     gradient_loss,
+    patch_reconstruction_loss,
     posterior_kl_loss,
     reconstruction_loss,
     weighted_reconstruction_loss,
@@ -49,10 +50,20 @@ class EpochSummary:
     kl_loss: float
     edge_loss: float
     weighted_recon_loss: float
+    patch_recon_loss: float
     feature_loss: float
     logit_loss: float
     lpips_loss: float
     noise_feature_loss: float
+    recon_term: float
+    kl_term: float
+    edge_term: float
+    weighted_recon_term: float
+    patch_recon_term: float
+    feature_term: float
+    logit_term: float
+    lpips_term: float
+    noise_feature_term: float
 
     def as_row(self) -> dict[str, Any]:
         return {
@@ -63,10 +74,20 @@ class EpochSummary:
             "kl_loss": self.kl_loss,
             "edge_loss": self.edge_loss,
             "weighted_recon_loss": self.weighted_recon_loss,
+            "patch_recon_loss": self.patch_recon_loss,
             "feature_loss": self.feature_loss,
             "logit_loss": self.logit_loss,
             "lpips_loss": self.lpips_loss,
             "noise_feature_loss": self.noise_feature_loss,
+            "recon_term": self.recon_term,
+            "kl_term": self.kl_term,
+            "edge_term": self.edge_term,
+            "weighted_recon_term": self.weighted_recon_term,
+            "patch_recon_term": self.patch_recon_term,
+            "feature_term": self.feature_term,
+            "logit_term": self.logit_term,
+            "lpips_term": self.lpips_term,
+            "noise_feature_term": self.noise_feature_term,
         }
 
 
@@ -205,6 +226,19 @@ def _resolve_loss_config(loss_cfg: dict[str, Any]) -> dict[str, dict[str, Any]]:
     weighted_recon.setdefault("type", cfg.get("weighted_recon_type", recon.get("type", "l1")))
     weighted_recon.setdefault("epsilon", float(cfg.get("weighted_recon_epsilon", recon.get("epsilon", 1.0e-3))))
 
+    patch_recon = _section(
+        cfg,
+        "patch_recon",
+        legacy_prefix="patch_recon",
+        default_weight=float(cfg.get("patch_recon_weight", 0.0)),
+    )
+    patch_recon.setdefault("type", cfg.get("patch_recon_type", recon.get("type", "l1")))
+    patch_recon.setdefault("epsilon", float(cfg.get("patch_recon_epsilon", recon.get("epsilon", 1.0e-3))))
+    patch_recon.setdefault("crop_ratio", cfg.get("patch_recon_crop_ratio", 0.5))
+    patch_recon.setdefault("crop_size", cfg.get("patch_recon_crop_size", None))
+    patch_recon.setdefault("center_x", float(cfg.get("patch_recon_center_x", 0.5)))
+    patch_recon.setdefault("center_y", float(cfg.get("patch_recon_center_y", 0.5)))
+
     feature = _section(cfg, "feature", legacy_prefix="feature", default_weight=float(cfg.get("feature_weight", 0.0)))
     feature.setdefault("type", cfg.get("feature_loss_type", "mse"))
 
@@ -237,6 +271,7 @@ def _resolve_loss_config(loss_cfg: dict[str, Any]) -> dict[str, dict[str, Any]]:
         "kl": kl,
         "edge": edge,
         "weighted_recon": weighted_recon,
+        "patch_recon": patch_recon,
         "feature": feature,
         "logit": logit,
         "lpips": lpips,
@@ -425,6 +460,7 @@ def _compute_loss_terms(
     recon_cfg = resolved["recon"]
     edge_cfg = resolved["edge"]
     weighted_recon_cfg = resolved["weighted_recon"]
+    patch_recon_cfg = resolved["patch_recon"]
     lpips_cfg = resolved["lpips"]
     noise_feature_cfg = resolved["noise_feature"]
     weight_map_cfg = resolved["weight_map"]
@@ -455,6 +491,7 @@ def _compute_loss_terms(
     kl_loss_value = posterior_kl_loss(posterior)
     edge_loss_value = batch.new_tensor(0.0)
     weighted_recon_loss_value = batch.new_tensor(0.0)
+    patch_recon_loss_value = batch.new_tensor(0.0)
     feature_loss_value = batch.new_tensor(0.0)
     logit_loss_value = batch.new_tensor(0.0)
     lpips_loss_value = batch.new_tensor(0.0)
@@ -477,6 +514,18 @@ def _compute_loss_terms(
             weight_map=weight_map,
             kind=str(weighted_recon_cfg.get("type", recon_cfg.get("type", "l1"))),
             epsilon=float(weighted_recon_cfg.get("epsilon", recon_cfg.get("epsilon", 1.0e-3))),
+        )
+
+    if float(patch_recon_cfg.get("weight", 0.0)) > 0:
+        patch_recon_loss_value = patch_reconstruction_loss(
+            recon,
+            batch,
+            kind=str(patch_recon_cfg.get("type", recon_cfg.get("type", "l1"))),
+            epsilon=float(patch_recon_cfg.get("epsilon", recon_cfg.get("epsilon", 1.0e-3))),
+            crop_size=(int(patch_recon_cfg["crop_size"]) if patch_recon_cfg.get("crop_size", None) not in {None, "", 0, "0"} else None),
+            crop_ratio=(float(patch_recon_cfg["crop_ratio"]) if patch_recon_cfg.get("crop_ratio", None) not in {None, ""} else None),
+            center_x=float(patch_recon_cfg.get("center_x", 0.5)),
+            center_y=float(patch_recon_cfg.get("center_y", 0.5)),
         )
 
     if float(lpips_cfg.get("weight", 0.0)) > 0:
@@ -515,6 +564,7 @@ def _compute_loss_terms(
         "kl": float(resolved["kl"].get("weight", 1.0e-6)),
         "edge": float(edge_cfg.get("weight", 0.0)),
         "weighted_recon": float(weighted_recon_cfg.get("weight", 0.0)),
+        "patch_recon": float(patch_recon_cfg.get("weight", 0.0)),
         "feature": float(feature_cfg.get("weight", 0.0)),
         "logit": float(logit_cfg.get("weight", 0.0)),
         "lpips": float(lpips_cfg.get("weight", 0.0)),
@@ -525,21 +575,35 @@ def _compute_loss_terms(
         + weights["kl"] * kl_loss_value
         + weights["edge"] * edge_loss_value
         + weights["weighted_recon"] * weighted_recon_loss_value
+        + weights["patch_recon"] * patch_recon_loss_value
         + weights["feature"] * feature_loss_value
         + weights["logit"] * logit_loss_value
         + weights["lpips"] * lpips_loss_value
         + weights["noise_feature"] * noise_feature_loss_value
     )
+    weighted_terms = {
+        "recon": weights["recon"] * recon_loss_value,
+        "kl": weights["kl"] * kl_loss_value,
+        "edge": weights["edge"] * edge_loss_value,
+        "weighted_recon": weights["weighted_recon"] * weighted_recon_loss_value,
+        "patch_recon": weights["patch_recon"] * patch_recon_loss_value,
+        "feature": weights["feature"] * feature_loss_value,
+        "logit": weights["logit"] * logit_loss_value,
+        "lpips": weights["lpips"] * lpips_loss_value,
+        "noise_feature": weights["noise_feature"] * noise_feature_loss_value,
+    }
     return {
         "total": total,
         "recon": recon_loss_value,
         "kl": kl_loss_value,
         "edge": edge_loss_value,
         "weighted_recon": weighted_recon_loss_value,
+        "patch_recon": patch_recon_loss_value,
         "feature": feature_loss_value,
         "logit": logit_loss_value,
         "lpips": lpips_loss_value,
         "noise_feature": noise_feature_loss_value,
+        "weighted_terms": weighted_terms,
         "recon_image": recon,
     }
 
@@ -582,7 +646,8 @@ def _run_epoch(
     if train:
         optimizer.zero_grad(set_to_none=True)
 
-    total = recon = kl = edge = weighted_recon = feat = logit = lpips_val = noise_feat = 0.0
+    total = recon = kl = edge = weighted_recon = patch_recon = feat = logit = lpips_val = noise_feat = 0.0
+    recon_term = kl_term = edge_term = weighted_recon_term = patch_recon_term = feat_term = logit_term = lpips_term = noise_feat_term = 0.0
     num_batches = 0
     num_items = 0.0
     optimizer_step = int(global_step_start)
@@ -618,10 +683,20 @@ def _run_epoch(
             "train/kl_step": float(terms["kl"].detach().cpu()),
             "train/edge_step": float(terms["edge"].detach().cpu()),
             "train/weighted_recon_step": float(terms["weighted_recon"].detach().cpu()),
+            "train/patch_recon_step": float(terms["patch_recon"].detach().cpu()),
             "train/feature_step": float(terms["feature"].detach().cpu()),
             "train/logit_step": float(terms["logit"].detach().cpu()),
             "train/lpips_step": float(terms["lpips"].detach().cpu()),
             "train/noise_feature_step": float(terms["noise_feature"].detach().cpu()),
+            "train/recon_term_step": float(terms["weighted_terms"]["recon"].detach().cpu()),
+            "train/kl_term_step": float(terms["weighted_terms"]["kl"].detach().cpu()),
+            "train/edge_term_step": float(terms["weighted_terms"]["edge"].detach().cpu()),
+            "train/weighted_recon_term_step": float(terms["weighted_terms"]["weighted_recon"].detach().cpu()),
+            "train/patch_recon_term_step": float(terms["weighted_terms"]["patch_recon"].detach().cpu()),
+            "train/feature_term_step": float(terms["weighted_terms"]["feature"].detach().cpu()),
+            "train/logit_term_step": float(terms["weighted_terms"]["logit"].detach().cpu()),
+            "train/lpips_term_step": float(terms["weighted_terms"]["lpips"].detach().cpu()),
+            "train/noise_feature_term_step": float(terms["weighted_terms"]["noise_feature"].detach().cpu()),
         }
         try:
             if scaler is not None:
@@ -671,10 +746,20 @@ def _run_epoch(
         kl += float(terms["kl"].detach().cpu()) * batch_items
         edge += float(terms["edge"].detach().cpu()) * batch_items
         weighted_recon += float(terms["weighted_recon"].detach().cpu()) * batch_items
+        patch_recon += float(terms["patch_recon"].detach().cpu()) * batch_items
         feat += float(terms["feature"].detach().cpu()) * batch_items
         logit += float(terms["logit"].detach().cpu()) * batch_items
         lpips_val += float(terms["lpips"].detach().cpu()) * batch_items
         noise_feat += float(terms["noise_feature"].detach().cpu()) * batch_items
+        recon_term += float(terms["weighted_terms"]["recon"].detach().cpu()) * batch_items
+        kl_term += float(terms["weighted_terms"]["kl"].detach().cpu()) * batch_items
+        edge_term += float(terms["weighted_terms"]["edge"].detach().cpu()) * batch_items
+        weighted_recon_term += float(terms["weighted_terms"]["weighted_recon"].detach().cpu()) * batch_items
+        patch_recon_term += float(terms["weighted_terms"]["patch_recon"].detach().cpu()) * batch_items
+        feat_term += float(terms["weighted_terms"]["feature"].detach().cpu()) * batch_items
+        logit_term += float(terms["weighted_terms"]["logit"].detach().cpu()) * batch_items
+        lpips_term += float(terms["weighted_terms"]["lpips"].detach().cpu()) * batch_items
+        noise_feat_term += float(terms["weighted_terms"]["noise_feature"].detach().cpu()) * batch_items
         num_batches += 1
         num_items += batch_items
 
@@ -686,6 +771,7 @@ def _run_epoch(
             postfix = {
                 "loss": f"{(total / denom):.4f}",
                 "recon": f"{(recon / denom):.4f}",
+                "recon*": f"{(recon_term / denom):.4f}",
             }
             if train:
                 postfix["lr"] = f"{optimizer.param_groups[0]['lr']:.2e}"
@@ -711,10 +797,20 @@ def _run_epoch(
         kl_loss=kl / denom,
         edge_loss=edge / denom,
         weighted_recon_loss=weighted_recon / denom,
+        patch_recon_loss=patch_recon / denom,
         feature_loss=feat / denom,
         logit_loss=logit / denom,
         lpips_loss=lpips_val / denom,
         noise_feature_loss=noise_feat / denom,
+        recon_term=recon_term / denom,
+        kl_term=kl_term / denom,
+        edge_term=edge_term / denom,
+        weighted_recon_term=weighted_recon_term / denom,
+        patch_recon_term=patch_recon_term / denom,
+        feature_term=feat_term / denom,
+        logit_term=logit_term / denom,
+        lpips_term=lpips_term / denom,
+        noise_feature_term=noise_feat_term / denom,
     )
     return summary, optimizer_step
 
@@ -797,6 +893,7 @@ def train_sd35_vae_from_config(cfg: dict[str, Any], config_path: str | Path) -> 
     ensure_dir(out_dir / "last")
     ensure_dir(out_dir / "best")
     ensure_dir(out_dir / "previews")
+    ensure_dir(out_dir / "epoch_summaries")
 
     dump_yaml(cfg, out_dir / "config_used.yaml")
 
@@ -813,6 +910,12 @@ def train_sd35_vae_from_config(cfg: dict[str, Any], config_path: str | Path) -> 
     device = torch.device(
         model_cfg.get("device", "cuda") if torch.cuda.is_available() and str(model_cfg.get("device", "cuda")) != "cpu" else "cpu"
     )
+    if bool(model_cfg.get("allow_tf32", False)) and device.type == "cuda":
+        try:
+            torch.backends.cuda.matmul.allow_tf32 = True
+            torch.backends.cudnn.allow_tf32 = True
+        except Exception:
+            pass
     dtype_str = str(model_cfg.get("torch_dtype", vae_cfg.get("dtype", "fp32"))).lower()
     amp_dtype = None
     if device.type == "cuda":
@@ -967,6 +1070,10 @@ def train_sd35_vae_from_config(cfg: dict[str, Any], config_path: str | Path) -> 
 
             history_rows.extend([train_summary.as_row(), val_summary.as_row()])
             write_csv(history_rows, out_dir / "history.csv")
+            write_json(
+                {"train": train_summary.as_row(), "val": val_summary.as_row()},
+                out_dir / "epoch_summaries" / f"epoch_{epoch:03d}.json",
+            )
 
             _save_vae_checkpoint(vae, out_dir / "last" / "vae")
             torch.save(
@@ -989,19 +1096,39 @@ def train_sd35_vae_from_config(cfg: dict[str, Any], config_path: str | Path) -> 
                 "train/kl_epoch": train_summary.kl_loss,
                 "train/edge_epoch": train_summary.edge_loss,
                 "train/weighted_recon_epoch": train_summary.weighted_recon_loss,
+                "train/patch_recon_epoch": train_summary.patch_recon_loss,
                 "train/feature_epoch": train_summary.feature_loss,
                 "train/logit_epoch": train_summary.logit_loss,
                 "train/lpips_epoch": train_summary.lpips_loss,
                 "train/noise_feature_epoch": train_summary.noise_feature_loss,
+                "train/recon_term_epoch": train_summary.recon_term,
+                "train/kl_term_epoch": train_summary.kl_term,
+                "train/edge_term_epoch": train_summary.edge_term,
+                "train/weighted_recon_term_epoch": train_summary.weighted_recon_term,
+                "train/patch_recon_term_epoch": train_summary.patch_recon_term,
+                "train/feature_term_epoch": train_summary.feature_term,
+                "train/logit_term_epoch": train_summary.logit_term,
+                "train/lpips_term_epoch": train_summary.lpips_term,
+                "train/noise_feature_term_epoch": train_summary.noise_feature_term,
                 "val/loss": val_summary.total_loss,
                 "val/recon": val_summary.recon_loss,
                 "val/kl": val_summary.kl_loss,
                 "val/edge": val_summary.edge_loss,
                 "val/weighted_recon": val_summary.weighted_recon_loss,
+                "val/patch_recon": val_summary.patch_recon_loss,
                 "val/feature": val_summary.feature_loss,
                 "val/logit": val_summary.logit_loss,
                 "val/lpips": val_summary.lpips_loss,
                 "val/noise_feature": val_summary.noise_feature_loss,
+                "val/recon_term": val_summary.recon_term,
+                "val/kl_term": val_summary.kl_term,
+                "val/edge_term": val_summary.edge_term,
+                "val/weighted_recon_term": val_summary.weighted_recon_term,
+                "val/patch_recon_term": val_summary.patch_recon_term,
+                "val/feature_term": val_summary.feature_term,
+                "val/logit_term": val_summary.logit_term,
+                "val/lpips_term": val_summary.lpips_term,
+                "val/noise_feature_term": val_summary.noise_feature_term,
                 "train/lr": float(optimizer.param_groups[0]["lr"]),
             }
             if preview_path.is_file():
@@ -1009,6 +1136,15 @@ def train_sd35_vae_from_config(cfg: dict[str, Any], config_path: str | Path) -> 
                 if wb_img is not None:
                     epoch_payload["preview/recon"] = wb_img
             wandb_session.log(epoch_payload, step=global_step)
+            print(
+                f"[epoch {epoch}/{epochs}] "
+                f"train: total={train_summary.total_loss:.6f}, recon={train_summary.recon_loss:.6f}, "
+                f"recon_term={train_summary.recon_term:.6f}, kl={train_summary.kl_loss:.6f}, kl_term={train_summary.kl_term:.6f}, "
+                f"patch={train_summary.patch_recon_loss:.6f}, wpatch={train_summary.patch_recon_term:.6f} | "
+                f"val: total={val_summary.total_loss:.6f}, recon={val_summary.recon_loss:.6f}, "
+                f"recon_term={val_summary.recon_term:.6f}, kl={val_summary.kl_loss:.6f}, kl_term={val_summary.kl_term:.6f}, "
+                f"patch={val_summary.patch_recon_loss:.6f}, wpatch={val_summary.patch_recon_term:.6f}"
+            )
 
             if val_summary.total_loss < best_val:
                 best_val = val_summary.total_loss
