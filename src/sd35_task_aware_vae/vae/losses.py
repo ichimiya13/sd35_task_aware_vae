@@ -73,6 +73,46 @@ def weighted_reconstruction_loss(
 
 
 
+def patch_reconstruction_loss(
+    pred,
+    target,
+    *,
+    kind: str = "l1",
+    epsilon: float = 1.0e-3,
+    crop_size: int | None = None,
+    crop_ratio: float | None = None,
+    center_x: float = 0.5,
+    center_y: float = 0.5,
+):
+    """Compute reconstruction loss on a single spatial crop shared by pred and target.
+
+    The crop is defined on the resized training image. `center_x` and `center_y` are
+    normalized coordinates in [0, 1] where 0.5 corresponds to the image center.
+    """
+    import math
+
+    h = int(pred.shape[-2])
+    w = int(pred.shape[-1])
+    if crop_size is None:
+        ratio = float(0.5 if crop_ratio is None else crop_ratio)
+        patch = max(1, int(round(min(h, w) * ratio)))
+    else:
+        patch = max(1, int(crop_size))
+    patch_h = min(h, patch)
+    patch_w = min(w, patch)
+
+    cx = float(center_x) * max(0, w - 1)
+    cy = float(center_y) * max(0, h - 1)
+    left = int(round(cx - patch_w / 2.0))
+    top = int(round(cy - patch_h / 2.0))
+    left = min(max(left, 0), max(0, w - patch_w))
+    top = min(max(top, 0), max(0, h - patch_h))
+
+    pred_patch = pred[..., top : top + patch_h, left : left + patch_w]
+    target_patch = target[..., top : top + patch_h, left : left + patch_w]
+    return reconstruction_loss(pred_patch, target_patch, kind=kind, reduction="mean", epsilon=epsilon)
+
+
 def _sobel_gradients(x):
     import torch
     import torch.nn.functional as F
