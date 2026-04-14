@@ -47,10 +47,10 @@ teacher:
 train:
   epochs: 10
   batch_size: 2
-  num_workers: 4
+  num_workers: 16
   lr: 1.0e-05
   weight_decay: 0.0
-  grad_accum_steps: 4
+  grad_accum_steps: 8
   optimizer: adamw
   lr_scheduler: cosine
   save_previews: true
@@ -67,7 +67,7 @@ loss:
     type: sobel_l1
     use_weight_map: false
   weighted_recon:
-    weight: 0.2
+    weight: 0.3
     type: charbonnier
     epsilon: 0.001
   patch_recon:

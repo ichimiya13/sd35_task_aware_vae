@@ -2,7 +2,7 @@ experiment_name: sd35m_vae_ft_decoder_only_center_patch_only
 seed: 42
 runtime:
   gpu_ids:
-  - 0
+  - 1
 data:
   root: ../data/uwf/multilabel/MedicalCheckup/splitted
   split_filename: default_split.yaml
@@ -47,10 +47,10 @@ teacher:
 train:
   epochs: 10
   batch_size: 2
-  num_workers: 4
+  num_workers: 16
   lr: 1.0e-05
   weight_decay: 0.0
-  grad_accum_steps: 4
+  grad_accum_steps: 8
   optimizer: adamw
   lr_scheduler: cosine
   save_previews: true
@@ -71,7 +71,7 @@ loss:
     type: l1
     epsilon: 0.001
   patch_recon:
-    weight: 0.2
+    weight: 0.3
     type: charbonnier
     epsilon: 0.001
     crop_ratio: 0.45

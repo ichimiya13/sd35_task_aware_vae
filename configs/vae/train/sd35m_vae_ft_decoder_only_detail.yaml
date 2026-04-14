@@ -2,7 +2,7 @@ experiment_name: sd35m_vae_ft_decoder_only_detail
 seed: 42
 
 runtime:
-  gpu_ids: [1]
+  gpu_ids: [6]
 
 data:
   root: "../data/uwf/multilabel/MedicalCheckup/splitted"
@@ -44,10 +44,10 @@ teacher:
 train:
   epochs: 10
   batch_size: 2
-  num_workers: 4
+  num_workers: 16
   lr: 1.0e-5
   weight_decay: 0.0
-  grad_accum_steps: 4
+  grad_accum_steps: 8
   optimizer: adamw
   lr_scheduler: cosine
   save_previews: true
@@ -61,11 +61,11 @@ loss:
   kl:
     weight: 1.0e-6
   edge:
-    weight: 0.03
+    weight: 0.2
     type: sobel_l1
     use_weight_map: false
   weighted_recon:
-    weight: 0.15
+    weight: 0.0
     type: l1
     epsilon: 1.0e-3
   weight_map:

@@ -8,6 +8,12 @@ from typing import Any
 def _resolve_vae_source(model_cfg: dict[str, Any], vae_cfg: dict[str, Any]) -> tuple[str, str]:
     checkpoint = vae_cfg.get("checkpoint", None)
     if checkpoint:
+        checkpoint_path = Path(str(checkpoint))
+        # Locally saved custom VAEs are typically saved with ``save_pretrained``
+        # directly into the checkpoint directory (e.g. ``.../best/vae``).  In that
+        # case we should *not* pass ``subfolder="vae"`` again.
+        if checkpoint_path.exists() and checkpoint_path.is_dir():
+            return str(checkpoint_path), ""
         return str(checkpoint), str(vae_cfg.get("subfolder", ""))
     repo_id = str(vae_cfg.get("model_repo_id", model_cfg.get("repo_id")))
     subfolder = str(vae_cfg.get("subfolder", "vae"))
