@@ -113,6 +113,68 @@ def patch_reconstruction_loss(
     return reconstruction_loss(pred_patch, target_patch, kind=kind, reduction="mean", epsilon=epsilon)
 
 
+
+
+def build_spatial_weight_map(batch, cfg: dict | None):
+    import torch
+
+    cfg = cfg or {}
+    mode = str(cfg.get("mode", "none")).lower()
+    if mode in {"none", "off", "disabled"}:
+        return None
+
+    supported_peripheral = {"peripheral", "radial", "periphery"}
+    supported_center = {"center_gaussian", "gaussian_center", "center", "gaussian"}
+    if mode not in supported_peripheral | supported_center:
+        raise ValueError(f"Unsupported weight_map.mode: {mode}")
+
+    b, _c, h, w = batch.shape
+    dtype = batch.dtype
+    device = batch.device
+    yy = torch.linspace(0.0, 1.0, steps=h, device=device, dtype=dtype).view(h, 1).expand(h, w)
+    xx = torch.linspace(0.0, 1.0, steps=w, device=device, dtype=dtype).view(1, w).expand(h, w)
+
+    gamma = float(cfg.get("gamma", 1.0))
+    min_w = float(cfg.get("min_weight", 1.0))
+    max_w = float(cfg.get("max_weight", 1.0))
+
+    if mode in supported_peripheral:
+        rr = torch.sqrt((xx - 0.5).pow(2) + (yy - 0.5).pow(2)) / math.sqrt(0.5)
+        rr = rr.clamp(0.0, 1.0)
+        inner = float(cfg.get("inner_radius", 0.0))
+        if inner > 0:
+            rr = ((rr - inner) / max(1.0e-6, 1.0 - inner)).clamp(0.0, 1.0)
+        if gamma != 1.0:
+            rr = rr.pow(gamma)
+        base = min_w + (max_w - min_w) * rr
+    else:
+        center_x = float(cfg.get("center_x", 0.5))
+        center_y = float(cfg.get("center_y", 0.5))
+        sigma_default = float(cfg.get("sigma", 0.22))
+        sigma_x = cfg.get("sigma_x", None)
+        sigma_y = cfg.get("sigma_y", None)
+        sigma_x = float(sigma_default if sigma_x in {None, '', 0, '0'} else sigma_x)
+        sigma_y = float(sigma_default if sigma_y in {None, '', 0, '0'} else sigma_y)
+        sigma_x = max(1.0e-4, sigma_x)
+        sigma_y = max(1.0e-4, sigma_y)
+
+        dx = (xx - center_x) / sigma_x
+        dy = (yy - center_y) / sigma_y
+        base_score = torch.exp(-0.5 * (dx.pow(2) + dy.pow(2)))
+        if gamma != 1.0:
+            base_score = base_score.pow(gamma)
+        base = min_w + (max_w - min_w) * base_score
+
+    weight_map = base.unsqueeze(0).unsqueeze(0).expand(b, 1, h, w).clone()
+
+    if bool(cfg.get("apply_retina_mask", True)):
+        x01 = (batch.clamp(-1.0, 1.0) + 1.0) / 2.0
+        retina = (x01.mean(dim=1, keepdim=True) > float(cfg.get("retina_threshold", 0.03))).to(dtype=dtype)
+        weight_map = 1.0 + retina * (weight_map - 1.0)
+
+    return weight_map
+
+
 def _sobel_gradients(x):
     import torch
     import torch.nn.functional as F

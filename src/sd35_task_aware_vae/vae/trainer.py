@@ -26,6 +26,7 @@ from src.sd35_task_aware_vae.utils.seed import seed_everything
 from src.sd35_task_aware_vae.utils.wandb import init_wandb_session, maybe_build_wandb_image
 from src.sd35_task_aware_vae.vae.losses import (
     LPIPSLoss,
+    build_spatial_weight_map,
     feature_distance,
     gradient_loss,
     patch_reconstruction_loss,
@@ -265,6 +266,11 @@ def _resolve_loss_config(loss_cfg: dict[str, Any]) -> dict[str, dict[str, Any]]:
     weight_map.setdefault("inner_radius", float(cfg.get("weight_map_inner_radius", 0.0)))
     weight_map.setdefault("retina_threshold", float(cfg.get("weight_map_retina_threshold", 0.03)))
     weight_map.setdefault("apply_retina_mask", bool(cfg.get("weight_map_apply_retina_mask", True)))
+    weight_map.setdefault("center_x", float(cfg.get("weight_map_center_x", 0.5)))
+    weight_map.setdefault("center_y", float(cfg.get("weight_map_center_y", 0.5)))
+    weight_map.setdefault("sigma", float(cfg.get("weight_map_sigma", 0.22)))
+    weight_map.setdefault("sigma_x", cfg.get("weight_map_sigma_x", None))
+    weight_map.setdefault("sigma_y", cfg.get("weight_map_sigma_y", None))
 
     return {
         "recon": recon,
@@ -374,45 +380,6 @@ def _sample_noisy_latents(latents, noise_cfg: dict[str, Any], generator=None):
 
 
 
-def _build_weight_map(batch, cfg: dict[str, Any] | None):
-    import torch
-
-    cfg = cfg or {}
-    mode = str(cfg.get("mode", "none")).lower()
-    if mode in {"none", "off", "disabled"}:
-        return None
-
-    if mode not in {"peripheral", "radial", "periphery"}:
-        raise ValueError(f"Unsupported weight_map.mode: {mode}")
-
-    b, _c, h, w = batch.shape
-    dtype = batch.dtype
-    device = batch.device
-    yy = torch.linspace(-1.0, 1.0, steps=h, device=device, dtype=dtype).view(h, 1).expand(h, w)
-    xx = torch.linspace(-1.0, 1.0, steps=w, device=device, dtype=dtype).view(1, w).expand(h, w)
-    rr = torch.sqrt(xx.pow(2) + yy.pow(2)) / math.sqrt(2.0)
-    rr = rr.clamp(0.0, 1.0)
-
-    inner = float(cfg.get("inner_radius", 0.0))
-    gamma = float(cfg.get("gamma", 1.0))
-    min_w = float(cfg.get("min_weight", 1.0))
-    max_w = float(cfg.get("max_weight", 1.0))
-    if inner > 0:
-        rr = ((rr - inner) / max(1.0e-6, 1.0 - inner)).clamp(0.0, 1.0)
-    if gamma != 1.0:
-        rr = rr.pow(gamma)
-
-    base = min_w + (max_w - min_w) * rr
-    weight_map = base.unsqueeze(0).unsqueeze(0).expand(b, 1, h, w).clone()
-
-    if bool(cfg.get("apply_retina_mask", True)):
-        x01 = (batch.clamp(-1.0, 1.0) + 1.0) / 2.0
-        retina = (x01.mean(dim=1, keepdim=True) > float(cfg.get("retina_threshold", 0.03))).to(dtype=dtype)
-        weight_map = 1.0 + retina * (weight_map - 1.0)
-
-    return weight_map
-
-
 
 def _resolve_posterior_modes(vae_cfg: dict[str, Any]) -> tuple[str, str]:
     posterior_cfg = vae_cfg.get("posterior", None)
@@ -479,7 +446,7 @@ def _compute_loss_terms(
     if float(weighted_recon_cfg.get("weight", 0.0)) > 0 or (
         float(edge_cfg.get("weight", 0.0)) > 0 and bool(edge_cfg.get("use_weight_map", False))
     ):
-        weight_map = _build_weight_map(batch, weight_map_cfg)
+        weight_map = build_spatial_weight_map(batch, weight_map_cfg)
 
     recon_loss_value = reconstruction_loss(
         recon,
