@@ -48,7 +48,7 @@ prompts:
   mode: neutral
   neutral_prompt: ultra-widefield fundus photograph, clinical retinal imaging, medically
     faithful
-  negative_prompt: cartoon, illustration, painting, text overlay, watermark
+  negative_prompt:
   offload_static_text_encoders: false
 vae:
   backend: sd35
@@ -80,7 +80,7 @@ optimizer:
   use_8bit_adam: false
 train:
   epochs: 80
-  max_train_steps: 5000
+  max_train_steps: 500000
   batch_size: 2
   num_workers: 4
   grad_accum_steps: 2
@@ -92,7 +92,7 @@ train:
   log_interval_steps: 10
   checkpoint_interval_steps: 500
   checkpoint_total_limit: 6
-  num_val_batches: 64
+  num_val_batches: null
   resume_from: null
   progress_bar: true
   tqdm_update_interval: 5
