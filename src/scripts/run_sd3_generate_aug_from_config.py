@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import shutil
+from collections import OrderedDict
 from pathlib import Path
 from typing import Any
 
@@ -11,20 +12,13 @@ import yaml
 from src.sd35_task_aware_vae.evaluation.generation_filter import filter_generated_probabilities
 from src.sd35_task_aware_vae.labels.schema import load_label_schema
 from src.sd35_task_aware_vae.sd3.pipeline_factory import build_sd3_img2img_pipeline, build_sd3_text2img_pipeline
-from src.sd35_task_aware_vae.sd3.prompts import build_class_prompt_entries, resolve_prompts
+from src.sd35_task_aware_vae.sd3.prompts import build_class_prompt_entries, build_neutral_prompt_entries, resolve_prompts
 from src.sd35_task_aware_vae.sd3.sampling import sample_img2img, sample_text2img
 from src.sd35_task_aware_vae.teacher_classifier import build_convnext_large, build_teacher_transforms
-from src.sd35_task_aware_vae.utils.config import dump_yaml
+from src.sd35_task_aware_vae.utils.config import dump_yaml, load_yaml
 from src.sd35_task_aware_vae.utils.device import get_gpu_ids, set_visible_gpus
 from src.sd35_task_aware_vae.utils.files import ensure_dir, write_csv, write_json
 from src.sd35_task_aware_vae.utils.seed import seed_everything
-
-
-
-def load_yaml(path: str | Path) -> dict[str, Any]:
-    with Path(path).open("r", encoding="utf-8") as f:
-        obj = yaml.safe_load(f)
-    return obj or {}
 
 
 
@@ -73,10 +67,47 @@ def save_image_with_label(
 
 
 
-def _write_label_yaml(path: Path, class_names: list[str], label_vector: np.ndarray) -> str:
-    payload = {str(name): int(float(label_vector[idx]) >= 0.5) for idx, name in enumerate(class_names)}
+def _resolve_label_template_path(out_cfg: dict[str, Any]) -> Path | None:
+    template = out_cfg.get("label_template_file", None)
+    if template is not None:
+        path = Path(template)
+        return path if path.is_file() else None
+    default_path = Path("label_sample.yaml")
+    return default_path if default_path.is_file() else None
+
+
+
+def _load_label_template(path: Path | None, class_names: list[str]) -> list[str]:
+    if path is None:
+        return [str(name) for name in class_names]
+    with path.open("r", encoding="utf-8") as f:
+        payload = yaml.safe_load(f) or {}
+    if not isinstance(payload, dict):
+        return [str(name) for name in class_names]
+
+    ordered_keys = [str(k) for k in payload.keys()]
+    known = set(ordered_keys)
+    for name in class_names:
+        if str(name) not in known:
+            ordered_keys.append(str(name))
+    return ordered_keys
+
+
+
+def _write_label_yaml(
+    path: Path,
+    *,
+    class_names: list[str],
+    label_vector: np.ndarray,
+    ordered_label_keys: list[str] | None = None,
+) -> str:
+    key_order = ordered_label_keys or [str(name) for name in class_names]
+    value_map = {str(name): int(float(label_vector[idx]) >= 0.5) for idx, name in enumerate(class_names)}
+    payload: OrderedDict[str, int] = OrderedDict()
+    for key in key_order:
+        payload[str(key)] = int(value_map.get(str(key), 0))
     with path.open("w", encoding="utf-8") as f:
-        yaml.safe_dump(payload, f, allow_unicode=True, sort_keys=False)
+        yaml.safe_dump(dict(payload), f, allow_unicode=True, sort_keys=False)
     return path.as_posix()
 
 
@@ -91,6 +122,7 @@ def _save_class_text2img_output(
     save_label: bool,
     class_names: list[str],
     label_vector: np.ndarray,
+    ordered_label_keys: list[str] | None = None,
 ) -> tuple[str, str | None]:
     class_dir = out_dir / target_id
     class_dir.mkdir(parents=True, exist_ok=True)
@@ -100,8 +132,30 @@ def _save_class_text2img_output(
 
     label_path = None
     if save_label:
-        label_path = _write_label_yaml(out_path.with_suffix(".yaml"), class_names, label_vector)
+        label_path = _write_label_yaml(
+            out_path.with_suffix(".yaml"),
+            class_names=class_names,
+            label_vector=label_vector,
+            ordered_label_keys=ordered_label_keys,
+        )
     return out_path.as_posix(), label_path
+
+
+
+def _save_neutral_text2img_output(
+    image,
+    *,
+    out_dir: Path,
+    sample_index: int,
+    filename_pattern: str,
+    target_id: str = "neutral",
+) -> str:
+    neutral_dir = out_dir / target_id
+    neutral_dir.mkdir(parents=True, exist_ok=True)
+    out_name = filename_pattern.format(target_id=target_id, idx=sample_index, suffix=".png")
+    out_path = neutral_dir / out_name
+    image.save(out_path)
+    return out_path.as_posix()
 
 
 
@@ -123,6 +177,24 @@ def _build_teacher_if_needed(cfg: dict[str, Any], class_names: list[str], device
     teacher.to(device)
     teacher.eval()
     return teacher
+
+
+
+def _is_neutral_count_generation(prompt_mode: str, mode: str, gen_cfg: dict[str, Any]) -> bool:
+    if mode != "text2img":
+        return False
+    if prompt_mode in {"neutral_count", "neutral_text2img", "count_neutral"}:
+        return True
+    return prompt_mode == "neutral" and any(
+        key in gen_cfg for key in ("num_images", "num_total_images", "num_images_total")
+    )
+
+
+
+def _normalize_count_value(value: Any, default: int = 1) -> int:
+    if value is None:
+        return int(default)
+    return max(0, int(value))
 
 
 
@@ -200,10 +272,12 @@ def main() -> None:
 
         filename_pattern = str(gen_cfg.get("filename_pattern", "{target_id}__{idx:04d}{suffix}"))
         save_label = bool(out_cfg.get("copy_labels", True))
-        num_images_per_target = int(gen_cfg.get("num_images_per_class", gen_cfg.get("num_images_per_input", 1)))
+        count_cfg = gen_cfg.get("num_images_per_class", gen_cfg.get("class_counts", gen_cfg.get("num_images_per_input", 1)))
         batch_size = int(gen_cfg.get("batch_size", 1))
-        entries = build_class_prompt_entries(class_names, prompt_cfg=prompt_cfg, num_images_per_target=num_images_per_target)
+        entries = build_class_prompt_entries(class_names, prompt_cfg=prompt_cfg, num_images_per_target=count_cfg)
         keep_expected = bool(filter_cfg.get("use_target_labels", True))
+        label_template_path = _resolve_label_template_path(out_cfg)
+        ordered_label_keys = _load_label_template(label_template_path, class_names)
 
         for start in range(0, len(entries), batch_size):
             chunk = entries[start:start + batch_size]
@@ -239,11 +313,12 @@ def main() -> None:
                         image,
                         out_dir=out_dir,
                         target_id=str(item["target_id"]),
-                        sample_index=start + local_idx,
+                        sample_index=int(item.get("sample_index", item.get("repeat_index", start + local_idx))),
                         filename_pattern=filename_pattern,
                         save_label=(save_label and kept),
                         class_names=class_names,
                         label_vector=np.asarray(item["label_vector"], dtype=np.float32),
+                        ordered_label_keys=ordered_label_keys,
                     )
                     if kept and save_path is not None:
                         try:
@@ -266,6 +341,71 @@ def main() -> None:
                         "max_probability": None if prob is None else float(prob[local_idx].max()),
                     }
                 )
+
+    elif _is_neutral_count_generation(prompt_mode, mode, gen_cfg):
+        filename_pattern = str(gen_cfg.get("filename_pattern", "{target_id}__{idx:04d}{suffix}"))
+        total_images = _normalize_count_value(
+            gen_cfg.get("num_images", gen_cfg.get("num_total_images", gen_cfg.get("num_images_total", 1))),
+            default=1,
+        )
+        batch_size = int(gen_cfg.get("batch_size", 1))
+        entries = build_neutral_prompt_entries(prompt_cfg=prompt_cfg, num_images=total_images)
+
+        for start in range(0, len(entries), batch_size):
+            chunk = entries[start:start + batch_size]
+            prompts = [item["prompt"] for item in chunk]
+            negative_prompts = [item["negative_prompt"] for item in chunk]
+            generated = sample_text2img(pipe, model_cfg, prompts, negative_prompts)
+
+            prob = None
+            score = None
+            keep_mask = np.ones((len(generated),), dtype=bool)
+            if filter_enabled and teacher is not None:
+                x_teacher = torch.stack([teacher_tf(img) for img in generated]).to(device)
+                with torch.no_grad():
+                    logits = teacher(x_teacher)
+                    prob = torch.sigmoid(logits).detach().cpu().numpy().astype(np.float32)
+                result = filter_generated_probabilities(
+                    prob,
+                    expected_labels=None,
+                    min_match_score=float(filter_cfg.get("min_match_score", 0.0)),
+                    min_max_probability=float(filter_cfg.get("min_max_probability", 0.0)),
+                )
+                keep_mask = result.keep_mask
+                score = result.match_score
+
+            for local_idx, (item, image) in enumerate(zip(chunk, generated)):
+                kept = bool(keep_mask[local_idx])
+                save_path = None
+                if kept or bool(out_cfg.get("save_rejected", False)):
+                    save_path = _save_neutral_text2img_output(
+                        image,
+                        out_dir=out_dir,
+                        sample_index=int(item.get("sample_index", start + local_idx)),
+                        filename_pattern=filename_pattern,
+                        target_id=str(item.get("target_id", "neutral")),
+                    )
+                    if kept and save_path is not None:
+                        try:
+                            rel = Path(save_path).relative_to(out_dir)
+                            saved_relpaths.append(rel.as_posix())
+                        except Exception:
+                            saved_relpaths.append(Path(save_path).name)
+                rows.append(
+                    {
+                        "source_path": None,
+                        "saved_path": save_path,
+                        "saved_label_path": None,
+                        "kept": kept,
+                        "target_id": item.get("target_id", "neutral"),
+                        "repeat_index": int(item.get("repeat_index", start + local_idx)),
+                        "prompt": item["prompt"],
+                        "negative_prompt": item["negative_prompt"],
+                        "match_score": None if score is None else float(score[local_idx]),
+                        "max_probability": None if prob is None else float(prob[local_idx].max()),
+                    }
+                )
+
     else:
         from src.sd35_task_aware_vae.datasets.image_dataset import MultiLabelMedicalDataset
 
