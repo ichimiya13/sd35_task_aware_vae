@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import random
 from pathlib import Path
-from typing import Any, Sequence
+from typing import Any, Mapping, Sequence
 
 from src.sd35_task_aware_vae.utils.config import load_yaml
 
@@ -117,6 +117,16 @@ def _select_active_labels(row, class_names: Sequence[str], prompt_cfg: dict[str,
 
 
 
+def _resolve_negative_prompt(prompt_cfg: dict[str, Any]) -> str:
+    if not bool(prompt_cfg.get("use_negative_prompt", True)):
+        return ""
+    prompt = prompt_cfg.get("negative_prompt", DEFAULT_NEGATIVE_PROMPT)
+    if prompt is None:
+        return ""
+    return _sanitize_prompt_piece(str(prompt))
+
+
+
 def build_neutral_prompts(batch_size: int, prompt_cfg: dict[str, Any] | None = None) -> list[str]:
     prompt_cfg = load_prompt_templates(prompt_cfg)
     prompt = str(prompt_cfg.get("neutral_prompt", DEFAULT_NEUTRAL_PROMPT))
@@ -126,7 +136,7 @@ def build_neutral_prompts(batch_size: int, prompt_cfg: dict[str, Any] | None = N
 
 def build_negative_prompts(batch_size: int, prompt_cfg: dict[str, Any] | None = None) -> list[str]:
     prompt_cfg = load_prompt_templates(prompt_cfg)
-    prompt = str(prompt_cfg.get("negative_prompt", DEFAULT_NEGATIVE_PROMPT))
+    prompt = _resolve_negative_prompt(prompt_cfg)
     return [prompt for _ in range(batch_size)]
 
 
@@ -176,11 +186,123 @@ def _normalize_class_target_spec(target: Any) -> list[str]:
 
 
 
+def _normalize_target_count_mapping(value: Any) -> dict[str, int]:
+    if isinstance(value, Mapping):
+        out: dict[str, int] = {}
+        for key, count in value.items():
+            out[str(key)] = max(0, int(count))
+        return out
+    return {}
+
+
+
+def _resolve_num_images_for_target(
+    cleaned_target: Sequence[str],
+    *,
+    default_count: int,
+    count_overrides: Mapping[str, int] | None = None,
+) -> int:
+    count_overrides = count_overrides or {}
+    target_id = "__".join(str(x) for x in cleaned_target)
+    candidate_keys = [target_id]
+    if len(cleaned_target) == 1:
+        candidate_keys.extend([str(cleaned_target[0])])
+    else:
+        candidate_keys.extend([
+            "+".join(str(x) for x in cleaned_target),
+            ",".join(str(x) for x in cleaned_target),
+        ])
+
+    for key in candidate_keys:
+        if key in count_overrides:
+            return max(0, int(count_overrides[key]))
+    return max(0, int(default_count))
+
+
+
+def _resolve_explicit_target_prompt(target_labels: Sequence[str], prompt_cfg: dict[str, Any]) -> str | None:
+    target_prompts = dict(prompt_cfg.get("target_prompts", {}) or {})
+    if not target_prompts:
+        return None
+    target_id = "__".join(str(x) for x in target_labels)
+    candidate_keys = [target_id]
+    if len(target_labels) == 1:
+        candidate_keys.append(str(target_labels[0]))
+    else:
+        candidate_keys.extend([
+            "+".join(str(x) for x in target_labels),
+            ",".join(str(x) for x in target_labels),
+        ])
+    for key in candidate_keys:
+        if key in target_prompts:
+            return _sanitize_prompt_piece(_pick_value(target_prompts[key]))
+    return None
+
+
+
+def _resolve_explicit_target_negative_prompt(target_labels: Sequence[str], prompt_cfg: dict[str, Any]) -> str | None:
+    target_negative_prompts = dict(prompt_cfg.get("target_negative_prompts", {}) or {})
+    if not target_negative_prompts:
+        return None
+    target_id = "__".join(str(x) for x in target_labels)
+    candidate_keys = [target_id]
+    if len(target_labels) == 1:
+        candidate_keys.append(str(target_labels[0]))
+    else:
+        candidate_keys.extend([
+            "+".join(str(x) for x in target_labels),
+            ",".join(str(x) for x in target_labels),
+        ])
+    for key in candidate_keys:
+        if key in target_negative_prompts:
+            return _sanitize_prompt_piece(_pick_value(target_negative_prompts[key]))
+    return None
+
+
+
+def build_neutral_prompt_entries(
+    prompt_cfg: dict[str, Any] | None = None,
+    *,
+    num_images: int,
+) -> list[dict[str, Any]]:
+    prompt_cfg = load_prompt_templates(prompt_cfg)
+    prompts_pool = _ensure_str_list(prompt_cfg.get("neutral_prompts", prompt_cfg.get("neutral_prompt", DEFAULT_NEUTRAL_PROMPT)))
+    if not prompts_pool:
+        prompts_pool = [DEFAULT_NEUTRAL_PROMPT]
+    negatives_pool = _ensure_str_list(prompt_cfg.get("negative_prompts", _resolve_negative_prompt(prompt_cfg)))
+    if not negatives_pool:
+        negatives_pool = [""]
+
+    strategy = str(prompt_cfg.get("neutral_prompt_strategy", "repeat")).lower()
+    entries: list[dict[str, Any]] = []
+    for idx in range(max(0, int(num_images))):
+        if strategy in {"cycle", "round_robin"}:
+            prompt = prompts_pool[idx % len(prompts_pool)]
+            negative = negatives_pool[idx % len(negatives_pool)]
+        elif strategy in {"random", "sample"}:
+            prompt = random.choice(prompts_pool)
+            negative = random.choice(negatives_pool)
+        else:
+            prompt = prompts_pool[0]
+            negative = negatives_pool[0]
+        entries.append(
+            {
+                "target_id": str(prompt_cfg.get("neutral_target_id", "neutral")),
+                "repeat_index": idx,
+                "sample_index": idx,
+                "prompt": _sanitize_prompt_piece(prompt),
+                "negative_prompt": _sanitize_prompt_piece(negative),
+            }
+        )
+    return entries
+
+
+
 def build_class_prompt_entries(
     class_names: Sequence[str],
     prompt_cfg: dict[str, Any] | None = None,
     *,
-    num_images_per_target: int = 1,
+    num_images_per_target: int | Mapping[str, int] = 1,
 ) -> list[dict[str, Any]]:
     prompt_cfg = load_prompt_templates(prompt_cfg)
     prompt_cfg = dict(prompt_cfg)
@@ -194,6 +316,13 @@ def build_class_prompt_entries(
         raw_targets = _ensure_str_list(targets_cfg) if isinstance(targets_cfg, str) else list(targets_cfg)
         targets = [_normalize_class_target_spec(t) for t in raw_targets]
 
+    if isinstance(num_images_per_target, Mapping):
+        default_count = int(prompt_cfg.get("default_num_images_per_class", 0))
+        count_overrides = _normalize_target_count_mapping(num_images_per_target)
+    else:
+        default_count = max(0, int(num_images_per_target))
+        count_overrides = _normalize_target_count_mapping(prompt_cfg.get("num_images_per_class", {}))
+
     label_index = {str(name): idx for idx, name in enumerate(class_names)}
     rows = []
     for target in targets:
@@ -203,15 +332,27 @@ def build_class_prompt_entries(
         label_vec = [0.0 for _ in class_names]
         for name in cleaned:
             label_vec[label_index[name]] = 1.0
-        prompt = build_label_conditioned_prompts([label_vec], class_names, prompt_cfg=prompt_cfg, threshold=0.5)[0]
-        negative = build_negative_prompts(1, prompt_cfg=prompt_cfg)[0]
+
+        target_count = _resolve_num_images_for_target(cleaned, default_count=default_count, count_overrides=count_overrides)
+        if target_count <= 0:
+            continue
+
+        explicit_prompt = _resolve_explicit_target_prompt(cleaned, prompt_cfg)
+        if explicit_prompt is None:
+            prompt = build_label_conditioned_prompts([label_vec], class_names, prompt_cfg=prompt_cfg, threshold=0.5)[0]
+        else:
+            prompt = explicit_prompt
+
+        explicit_negative = _resolve_explicit_target_negative_prompt(cleaned, prompt_cfg)
+        negative = explicit_negative if explicit_negative is not None else build_negative_prompts(1, prompt_cfg=prompt_cfg)[0]
         target_id = "__".join(cleaned)
-        for rep in range(int(num_images_per_target)):
+        for rep in range(target_count):
             rows.append(
                 {
                     "target_labels": cleaned,
                     "target_id": target_id,
                     "repeat_index": int(rep),
+                    "sample_index": int(rep),
                     "label_vector": list(label_vec),
                     "prompt": prompt,
                     "negative_prompt": negative,
@@ -232,7 +373,7 @@ def resolve_prompts(
 
     if mode == "explicit":
         prompt = prompt_cfg.get("prompt", DEFAULT_NEUTRAL_PROMPT)
-        negative = prompt_cfg.get("negative_prompt", DEFAULT_NEGATIVE_PROMPT)
+        negative = _resolve_negative_prompt(prompt_cfg)
         prompts = [str(prompt) for _ in range(batch_size)]
         negatives = [str(negative) for _ in range(batch_size)]
         return prompts, negatives
