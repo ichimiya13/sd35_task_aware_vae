@@ -2,7 +2,7 @@ experiment_name: sd35m_vae_ft_decoder_only_weighted_recon_only
 seed: 42
 runtime:
   gpu_ids:
-  - 0
+  - 1
 data:
   root: ../data/uwf/multilabel/MedicalCheckup/splitted
   split_filename: default_split.yaml
