@@ -850,7 +850,6 @@ def _estimate_and_save_latent_stats(
 def train_sd35_vae_from_config(cfg: dict[str, Any], config_path: str | Path) -> Path:
     import torch
     from torch.utils.data import DataLoader
-    from src.sd35_task_aware_vae.utils.device import describe_visible_gpus
 
     seed_everything(int(cfg.get("seed", 42)), deterministic=bool(cfg.get("deterministic", False)))
 
@@ -875,17 +874,9 @@ def train_sd35_vae_from_config(cfg: dict[str, Any], config_path: str | Path) -> 
     if str(vae_cfg.get("backend", model_cfg.get("family", "sd35"))).lower() not in {"sd35", "sd3", "stable_diffusion_3", "stable-diffusion-3"}:
         raise ValueError("train_sd35_vae_from_config only supports vae.backend=sd35")
 
-    requested_device = str(model_cfg.get("device", "cuda")).lower()
-    cuda_requested = requested_device != "cpu"
-    cuda_available = torch.cuda.is_available()
-    if cuda_requested and not cuda_available:
-        visible = describe_visible_gpus()
-        raise RuntimeError(
-            "CUDA device was requested but is not available. "
-            f"Check runtime.gpu_ids / CUDA_VISIBLE_DEVICES (current='{visible}')."
-        )
-
-    device = torch.device(requested_device if cuda_available and cuda_requested else "cpu")
+    device = torch.device(
+        model_cfg.get("device", "cuda") if torch.cuda.is_available() and str(model_cfg.get("device", "cuda")) != "cpu" else "cpu"
+    )
     if bool(model_cfg.get("allow_tf32", False)) and device.type == "cuda":
         try:
             torch.backends.cuda.matmul.allow_tf32 = True

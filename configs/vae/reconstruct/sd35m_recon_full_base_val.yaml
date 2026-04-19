@@ -1,4 +1,4 @@
-experiment_name: sd35m_recon_official_val
+experiment_name: sd35m_recon_full_base_val
 seed: 42
 
 data:
@@ -20,13 +20,12 @@ model:
 
 vae:
   backend: sd35
-  use_official: true
-  checkpoint: null
-  subfolder: vae
+  use_official: false
+  checkpoint: outputs/checkpoints/vae/sd35m_vae_ft_full_base/best/vae_latent_calibrated
   posterior: mode
 
 inference:
-  batch_size: 2
+  batch_size: 1
   num_workers: 2
 
 noise:
