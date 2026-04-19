@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import math
+import os
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -29,11 +30,23 @@ from src.sd35_task_aware_vae.vae.losses import (
     build_spatial_weight_map,
     feature_distance,
     gradient_loss,
+    latent_covariance_gram_loss,
     patch_reconstruction_loss,
     posterior_kl_loss,
     reconstruction_loss,
     weighted_reconstruction_loss,
 )
+
+
+@dataclass
+class DistributedContext:
+    use_ddp: bool
+    rank: int
+    local_rank: int
+    world_size: int
+    is_main_process: bool
+    device: Any
+
 
 
 @dataclass
@@ -56,6 +69,7 @@ class EpochSummary:
     logit_loss: float
     lpips_loss: float
     noise_feature_loss: float
+    latent_distribution_loss: float
     recon_term: float
     kl_term: float
     edge_term: float
@@ -65,6 +79,7 @@ class EpochSummary:
     logit_term: float
     lpips_term: float
     noise_feature_term: float
+    latent_distribution_term: float
 
     def as_row(self) -> dict[str, Any]:
         return {
@@ -80,6 +95,7 @@ class EpochSummary:
             "logit_loss": self.logit_loss,
             "lpips_loss": self.lpips_loss,
             "noise_feature_loss": self.noise_feature_loss,
+            "latent_distribution_loss": self.latent_distribution_loss,
             "recon_term": self.recon_term,
             "kl_term": self.kl_term,
             "edge_term": self.edge_term,
@@ -89,6 +105,7 @@ class EpochSummary:
             "logit_term": self.logit_term,
             "lpips_term": self.lpips_term,
             "noise_feature_term": self.noise_feature_term,
+            "latent_distribution_term": self.latent_distribution_term,
         }
 
 
@@ -258,6 +275,20 @@ def _resolve_loss_config(loss_cfg: dict[str, Any]) -> dict[str, dict[str, Any]]:
     )
     noise_feature.setdefault("type", cfg.get("noise_feature_loss_type", feature.get("type", "mse")))
 
+    latent_distribution = _section(
+        cfg,
+        "latent_distribution",
+        legacy_prefix="latent_distribution",
+        default_weight=float(cfg.get("latent_distribution_weight", 0.0)),
+    )
+    latent_distribution.setdefault("type", cfg.get("latent_distribution_type", "mean_covariance"))
+    latent_distribution.setdefault("max_tokens", cfg.get("latent_distribution_max_tokens", 4096))
+    latent_distribution.setdefault("include_mean", cfg.get("latent_distribution_include_mean", None))
+    latent_distribution.setdefault("mean_weight", float(cfg.get("latent_distribution_mean_weight", 1.0)))
+    latent_distribution.setdefault("matrix_weight", float(cfg.get("latent_distribution_matrix_weight", 1.0)))
+    latent_distribution.setdefault("posterior", cfg.get("latent_distribution_posterior", "mode"))
+    latent_distribution.setdefault("reference", cfg.get("latent_distribution_reference", {}) or {})
+
     weight_map = dict(cfg.get("weight_map", {}) or {})
     weight_map.setdefault("mode", str(cfg.get("weight_map_mode", "none")))
     weight_map.setdefault("min_weight", float(cfg.get("weight_map_min_weight", 1.0)))
@@ -282,6 +313,7 @@ def _resolve_loss_config(loss_cfg: dict[str, Any]) -> dict[str, dict[str, Any]]:
         "logit": logit,
         "lpips": lpips,
         "noise_feature": noise_feature,
+        "latent_distribution": latent_distribution,
         "weight_map": weight_map,
     }
 
@@ -322,6 +354,34 @@ def build_teacher_if_needed(cfg: dict[str, Any], num_classes: int, device):
         p.requires_grad_(False)
     return teacher
 
+
+
+def build_reference_vae_if_needed(cfg: dict[str, Any], model_cfg: dict[str, Any], vae_cfg: dict[str, Any], device, torch_dtype=None):
+    loss_cfg = cfg.get("loss", {}) or {}
+    latent_cfg = _resolve_loss_config(loss_cfg)["latent_distribution"]
+    if float(latent_cfg.get("weight", 0.0)) <= 0:
+        return None
+
+    ref_cfg = dict(latent_cfg.get("reference", {}) or {})
+    if not ref_cfg:
+        ref_cfg = {
+            "backend": "sd35",
+            "checkpoint": None,
+            "subfolder": vae_cfg.get("subfolder", "vae"),
+            "model_repo_id": vae_cfg.get("model_repo_id", model_cfg.get("repo_id")),
+            "eval_mode": True,
+        }
+    else:
+        ref_cfg.setdefault("backend", "sd35")
+        ref_cfg.setdefault("subfolder", vae_cfg.get("subfolder", "vae"))
+        ref_cfg.setdefault("model_repo_id", vae_cfg.get("model_repo_id", model_cfg.get("repo_id")))
+        ref_cfg.setdefault("eval_mode", True)
+
+    ref_vae = build_sd3_vae(model_cfg, ref_cfg, torch_dtype=torch_dtype, device=device)
+    ref_vae.eval()
+    for p in ref_vae.parameters():
+        p.requires_grad_(False)
+    return ref_vae
 
 
 def _extract_teacher_views(
@@ -418,6 +478,7 @@ def _compute_loss_terms(
     noise_cfg: dict[str, Any],
     generator=None,
     lpips_module=None,
+    reference_vae=None,
 ):
     import torch
 
@@ -430,6 +491,7 @@ def _compute_loss_terms(
     patch_recon_cfg = resolved["patch_recon"]
     lpips_cfg = resolved["lpips"]
     noise_feature_cfg = resolved["noise_feature"]
+    latent_distribution_cfg = resolved["latent_distribution"]
     weight_map_cfg = resolved["weight_map"]
     feature_stage = teacher_cfg.get("feature_stage", "embedding")
 
@@ -463,6 +525,28 @@ def _compute_loss_terms(
     logit_loss_value = batch.new_tensor(0.0)
     lpips_loss_value = batch.new_tensor(0.0)
     noise_feature_loss_value = batch.new_tensor(0.0)
+    latent_distribution_loss_value = batch.new_tensor(0.0)
+
+    if float(latent_distribution_cfg.get("weight", 0.0)) > 0:
+        if reference_vae is None:
+            raise RuntimeError("latent_distribution.weight > 0 requires a reference VAE")
+        ref_mode = str(latent_distribution_cfg.get("posterior", "mode"))
+        with torch.no_grad():
+            reference_latents = encode_to_latents(reference_vae, batch, sample_mode=ref_mode)
+        max_tokens = latent_distribution_cfg.get("max_tokens", 4096)
+        max_tokens = None if max_tokens in {None, "", 0, "0"} else int(max_tokens)
+        include_mean = latent_distribution_cfg.get("include_mean", None)
+        if isinstance(include_mean, str):
+            include_mean = None if include_mean.lower() in {"auto", "none", "null", ""} else include_mean.lower() in {"1", "true", "yes", "y", "on"}
+        latent_distribution_loss_value = latent_covariance_gram_loss(
+            latents,
+            reference_latents,
+            kind=str(latent_distribution_cfg.get("type", "mean_covariance")),
+            max_tokens=max_tokens,
+            include_mean=include_mean,
+            mean_weight=float(latent_distribution_cfg.get("mean_weight", 1.0)),
+            matrix_weight=float(latent_distribution_cfg.get("matrix_weight", 1.0)),
+        )
 
     if float(edge_cfg.get("weight", 0.0)) > 0:
         edge_loss_value = gradient_loss(
@@ -536,6 +620,7 @@ def _compute_loss_terms(
         "logit": float(logit_cfg.get("weight", 0.0)),
         "lpips": float(lpips_cfg.get("weight", 0.0)),
         "noise_feature": float(noise_feature_cfg.get("weight", 0.0)),
+        "latent_distribution": float(latent_distribution_cfg.get("weight", 0.0)),
     }
     total = (
         weights["recon"] * recon_loss_value
@@ -547,6 +632,7 @@ def _compute_loss_terms(
         + weights["logit"] * logit_loss_value
         + weights["lpips"] * lpips_loss_value
         + weights["noise_feature"] * noise_feature_loss_value
+        + weights["latent_distribution"] * latent_distribution_loss_value
     )
     weighted_terms = {
         "recon": weights["recon"] * recon_loss_value,
@@ -558,6 +644,7 @@ def _compute_loss_terms(
         "logit": weights["logit"] * logit_loss_value,
         "lpips": weights["lpips"] * lpips_loss_value,
         "noise_feature": weights["noise_feature"] * noise_feature_loss_value,
+        "latent_distribution": weights["latent_distribution"] * latent_distribution_loss_value,
     }
     return {
         "total": total,
@@ -570,6 +657,7 @@ def _compute_loss_terms(
         "logit": logit_loss_value,
         "lpips": lpips_loss_value,
         "noise_feature": noise_feature_loss_value,
+        "latent_distribution": latent_distribution_loss_value,
         "weighted_terms": weighted_terms,
         "recon_image": recon,
     }
@@ -604,6 +692,9 @@ def _run_epoch(
     progress_mininterval: float = 0.5,
     progress_leave: bool = False,
     lpips_module=None,
+    reference_vae=None,
+    loss_module=None,
+    dist_context: DistributedContext | None = None,
 ):
     import torch
     from torchvision.utils import save_image
@@ -613,8 +704,8 @@ def _run_epoch(
     if train:
         optimizer.zero_grad(set_to_none=True)
 
-    total = recon = kl = edge = weighted_recon = patch_recon = feat = logit = lpips_val = noise_feat = 0.0
-    recon_term = kl_term = edge_term = weighted_recon_term = patch_recon_term = feat_term = logit_term = lpips_term = noise_feat_term = 0.0
+    total = recon = kl = edge = weighted_recon = patch_recon = feat = logit = lpips_val = noise_feat = latent_dist = 0.0
+    recon_term = kl_term = edge_term = weighted_recon_term = patch_recon_term = feat_term = logit_term = lpips_term = noise_feat_term = latent_dist_term = 0.0
     num_batches = 0
     num_items = 0.0
     optimizer_step = int(global_step_start)
@@ -624,7 +715,7 @@ def _run_epoch(
     progress_update_interval = max(1, int(progress_update_interval))
     progress = None
     iterator = loader
-    if tqdm is not None and use_progress_bar:
+    if tqdm is not None and use_progress_bar and (dist_context is None or dist_context.is_main_process):
         progress = tqdm(
             loader,
             total=total_batches,
@@ -655,6 +746,7 @@ def _run_epoch(
             "train/logit_step": float(terms["logit"].detach().cpu()),
             "train/lpips_step": float(terms["lpips"].detach().cpu()),
             "train/noise_feature_step": float(terms["noise_feature"].detach().cpu()),
+            "train/latent_distribution_step": float(terms["latent_distribution"].detach().cpu()),
             "train/recon_term_step": float(terms["weighted_terms"]["recon"].detach().cpu()),
             "train/kl_term_step": float(terms["weighted_terms"]["kl"].detach().cpu()),
             "train/edge_term_step": float(terms["weighted_terms"]["edge"].detach().cpu()),
@@ -664,6 +756,7 @@ def _run_epoch(
             "train/logit_term_step": float(terms["weighted_terms"]["logit"].detach().cpu()),
             "train/lpips_term_step": float(terms["weighted_terms"]["lpips"].detach().cpu()),
             "train/noise_feature_term_step": float(terms["weighted_terms"]["noise_feature"].detach().cpu()),
+            "train/latent_distribution_term_step": float(terms["weighted_terms"]["latent_distribution"].detach().cpu()),
         }
         try:
             if scaler is not None:
@@ -679,18 +772,33 @@ def _run_epoch(
 
         with torch.set_grad_enabled(train):
             with torch.autocast(device_type=device.type, dtype=amp_dtype, enabled=autocast_enabled):
-                terms = _compute_loss_terms(
-                    vae=vae,
-                    batch=images,
-                    teacher=teacher,
-                    mean=mean,
-                    std=std,
-                    loss_cfg=loss_cfg,
-                    teacher_cfg=teacher_cfg,
-                    posterior_mode=posterior_mode,
-                    noise_cfg=noise_cfg,
-                    lpips_module=lpips_module,
-                )
+                if loss_module is not None:
+                    terms = loss_module(
+                        images,
+                        teacher=teacher,
+                        mean=mean,
+                        std=std,
+                        loss_cfg=loss_cfg,
+                        teacher_cfg=teacher_cfg,
+                        posterior_mode=posterior_mode,
+                        noise_cfg=noise_cfg,
+                        lpips_module=lpips_module,
+                        reference_vae=reference_vae,
+                    )
+                else:
+                    terms = _compute_loss_terms(
+                        vae=vae,
+                        batch=images,
+                        teacher=teacher,
+                        mean=mean,
+                        std=std,
+                        loss_cfg=loss_cfg,
+                        teacher_cfg=teacher_cfg,
+                        posterior_mode=posterior_mode,
+                        noise_cfg=noise_cfg,
+                        lpips_module=lpips_module,
+                        reference_vae=reference_vae,
+                    )
                 loss = terms["total"] / max(1, grad_accum_steps)
 
             if train:
@@ -718,6 +826,7 @@ def _run_epoch(
         logit += float(terms["logit"].detach().cpu()) * batch_items
         lpips_val += float(terms["lpips"].detach().cpu()) * batch_items
         noise_feat += float(terms["noise_feature"].detach().cpu()) * batch_items
+        latent_dist += float(terms["latent_distribution"].detach().cpu()) * batch_items
         recon_term += float(terms["weighted_terms"]["recon"].detach().cpu()) * batch_items
         kl_term += float(terms["weighted_terms"]["kl"].detach().cpu()) * batch_items
         edge_term += float(terms["weighted_terms"]["edge"].detach().cpu()) * batch_items
@@ -727,6 +836,7 @@ def _run_epoch(
         logit_term += float(terms["weighted_terms"]["logit"].detach().cpu()) * batch_items
         lpips_term += float(terms["weighted_terms"]["lpips"].detach().cpu()) * batch_items
         noise_feat_term += float(terms["weighted_terms"]["noise_feature"].detach().cpu()) * batch_items
+        latent_dist_term += float(terms["weighted_terms"]["latent_distribution"].detach().cpu()) * batch_items
         num_batches += 1
         num_items += batch_items
 
@@ -755,6 +865,24 @@ def _run_epoch(
     if progress is not None:
         progress.close()
 
+    if dist_context is not None and dist_context.use_ddp:
+        import torch
+        try:
+            import torch.distributed as dist
+            values = torch.tensor([
+                total, recon, kl, edge, weighted_recon, patch_recon, feat, logit, lpips_val, noise_feat, latent_dist,
+                recon_term, kl_term, edge_term, weighted_recon_term, patch_recon_term, feat_term, logit_term, lpips_term, noise_feat_term, latent_dist_term,
+                num_items,
+            ], device=device, dtype=torch.float64)
+            dist.all_reduce(values, op=dist.ReduceOp.SUM)
+            (
+                total, recon, kl, edge, weighted_recon, patch_recon, feat, logit, lpips_val, noise_feat, latent_dist,
+                recon_term, kl_term, edge_term, weighted_recon_term, patch_recon_term, feat_term, logit_term, lpips_term, noise_feat_term, latent_dist_term,
+                num_items,
+            ) = [float(x) for x in values.detach().cpu().tolist()]
+        except Exception:
+            pass
+
     denom = float(max(1.0, num_items))
     summary = EpochSummary(
         epoch=epoch,
@@ -769,6 +897,7 @@ def _run_epoch(
         logit_loss=logit / denom,
         lpips_loss=lpips_val / denom,
         noise_feature_loss=noise_feat / denom,
+        latent_distribution_loss=latent_dist / denom,
         recon_term=recon_term / denom,
         kl_term=kl_term / denom,
         edge_term=edge_term / denom,
@@ -778,6 +907,7 @@ def _run_epoch(
         logit_term=logit_term / denom,
         lpips_term=lpips_term / denom,
         noise_feature_term=noise_feat_term / denom,
+        latent_distribution_term=latent_dist_term / denom,
     )
     return summary, optimizer_step
 
@@ -847,11 +977,95 @@ def _estimate_and_save_latent_stats(
 
 
 
+
+class _VAEForwardWrapper:
+    def __init__(self, vae):
+        import torch
+
+        class _Inner(torch.nn.Module):
+            def __init__(self, vae_module):
+                super().__init__()
+                self.vae = vae_module
+
+            def forward(self, batch, **kwargs):
+                return _compute_loss_terms(vae=self.vae, batch=batch, **kwargs)
+
+        self.module = _Inner(vae)
+
+
+def _setup_vae_distributed_context(cfg: dict[str, Any], model_cfg: dict[str, Any]) -> DistributedContext:
+    import torch
+
+    distributed_cfg = cfg.get("distributed", {}) or {}
+    requested = bool(distributed_cfg.get("enabled", False))
+    world_size = int(os.environ.get("WORLD_SIZE", "1"))
+    rank = int(os.environ.get("RANK", "0"))
+    local_rank = int(os.environ.get("LOCAL_RANK", "0"))
+    use_ddp = requested and world_size > 1 and torch.cuda.is_available()
+    if requested and world_size <= 1:
+        print("[warn] distributed.enabled=true but WORLD_SIZE=1. Launch with torchrun to enable VAE DDP.", flush=True)
+
+    if use_ddp:
+        import datetime
+        import torch.distributed as dist
+
+        torch.cuda.set_device(local_rank)
+        if not dist.is_initialized():
+            dist.init_process_group(
+                backend=str(distributed_cfg.get("backend", "nccl")),
+                init_method="env://",
+                timeout=datetime.timedelta(seconds=int(distributed_cfg.get("timeout_seconds", 7200))),
+            )
+        device = torch.device(f"cuda:{local_rank}")
+    else:
+        if torch.cuda.is_available() and str(model_cfg.get("device", "cuda")) != "cpu":
+            torch.cuda.set_device(0)
+            device = torch.device("cuda")
+        else:
+            device = torch.device("cpu")
+
+    return DistributedContext(
+        use_ddp=use_ddp,
+        rank=rank if use_ddp else 0,
+        local_rank=local_rank if use_ddp else 0,
+        world_size=world_size if use_ddp else 1,
+        is_main_process=(rank == 0) if use_ddp else True,
+        device=device,
+    )
+
+
+def _barrier_vae(context: DistributedContext) -> None:
+    if not context.use_ddp:
+        return
+    try:
+        import torch.distributed as dist
+        if dist.is_available() and dist.is_initialized():
+            dist.barrier()
+    except Exception:
+        pass
+
+
+def _cleanup_vae_distributed(context: DistributedContext) -> None:
+    if not context.use_ddp:
+        return
+    try:
+        import torch.distributed as dist
+        if dist.is_available() and dist.is_initialized():
+            dist.destroy_process_group()
+    except Exception:
+        pass
+
+
 def train_sd35_vae_from_config(cfg: dict[str, Any], config_path: str | Path) -> Path:
     import torch
     from torch.utils.data import DataLoader
 
-    seed_everything(int(cfg.get("seed", 42)), deterministic=bool(cfg.get("deterministic", False)))
+    model_cfg = cfg.get("model", {}) or {}
+    dist_context = _setup_vae_distributed_context(cfg, model_cfg)
+    seed_everything(
+        int(cfg.get("seed", 42)) + int(dist_context.rank),
+        deterministic=bool(cfg.get("deterministic", False)),
+    )
 
     exp_name = str(cfg.get("experiment_name", "sd35_vae_train"))
     out_cfg = cfg.get("output", {}) or {}
@@ -862,7 +1076,8 @@ def train_sd35_vae_from_config(cfg: dict[str, Any], config_path: str | Path) -> 
     ensure_dir(out_dir / "previews")
     ensure_dir(out_dir / "epoch_summaries")
 
-    dump_yaml(cfg, out_dir / "config_used.yaml")
+    if dist_context.is_main_process:
+        dump_yaml(cfg, out_dir / "config_used.yaml")
 
     model_cfg = cfg.get("model", {}) or {}
     vae_cfg = cfg.get("vae", {}) or {}
@@ -874,9 +1089,7 @@ def train_sd35_vae_from_config(cfg: dict[str, Any], config_path: str | Path) -> 
     if str(vae_cfg.get("backend", model_cfg.get("family", "sd35"))).lower() not in {"sd35", "sd3", "stable_diffusion_3", "stable-diffusion-3"}:
         raise ValueError("train_sd35_vae_from_config only supports vae.backend=sd35")
 
-    device = torch.device(
-        model_cfg.get("device", "cuda") if torch.cuda.is_available() and str(model_cfg.get("device", "cuda")) != "cpu" else "cpu"
-    )
+    device = dist_context.device
     if bool(model_cfg.get("allow_tf32", False)) and device.type == "cuda":
         try:
             torch.backends.cuda.matmul.allow_tf32 = True
@@ -897,18 +1110,40 @@ def train_sd35_vae_from_config(cfg: dict[str, Any], config_path: str | Path) -> 
     num_workers = int(train_cfg.get("num_workers", 4))
     grad_accum_steps = int(train_cfg.get("grad_accum_steps", 1))
 
+    drop_last = bool(train_cfg.get("drop_last", True))
+    train_sampler = None
+    val_sampler = None
+    if dist_context.use_ddp:
+        from torch.utils.data import DistributedSampler
+        train_sampler = DistributedSampler(
+            train_ds,
+            num_replicas=dist_context.world_size,
+            rank=dist_context.rank,
+            shuffle=True,
+            drop_last=drop_last,
+        )
+        val_sampler = DistributedSampler(
+            val_ds,
+            num_replicas=dist_context.world_size,
+            rank=dist_context.rank,
+            shuffle=False,
+            drop_last=False,
+        )
+
     train_loader = DataLoader(
         train_ds,
         batch_size=batch_size,
-        shuffle=True,
+        shuffle=(train_sampler is None),
+        sampler=train_sampler,
         num_workers=num_workers,
         pin_memory=(device.type == "cuda"),
-        drop_last=bool(train_cfg.get("drop_last", True)),
+        drop_last=drop_last,
     )
     val_loader = DataLoader(
         val_ds,
         batch_size=batch_size,
         shuffle=False,
+        sampler=val_sampler,
         num_workers=num_workers,
         pin_memory=(device.type == "cuda"),
     )
@@ -920,9 +1155,29 @@ def train_sd35_vae_from_config(cfg: dict[str, Any], config_path: str | Path) -> 
         unfreeze_patterns=[str(x) for x in (vae_cfg.get("unfreeze_patterns", []) or [])],
     )
 
+    reference_vae = build_reference_vae_if_needed(
+        cfg,
+        model_cfg=model_cfg,
+        vae_cfg=vae_cfg,
+        device=device,
+        torch_dtype=torch.float32,
+    )
+
     trainable = [p for p in vae.parameters() if p.requires_grad]
     if not trainable:
         raise RuntimeError("No trainable VAE parameters remain after applying freeze/unfreeze patterns")
+
+    loss_module = _VAEForwardWrapper(vae).module
+    if dist_context.use_ddp:
+        from torch.nn.parallel import DistributedDataParallel as DDP
+        ddp_cfg = cfg.get("distributed", {}) or {}
+        ddp_kwargs = dict(
+            find_unused_parameters=bool(ddp_cfg.get("find_unused_parameters", False)),
+            broadcast_buffers=bool(ddp_cfg.get("broadcast_buffers", False)),
+        )
+        if device.type == "cuda":
+            ddp_kwargs.update(device_ids=[dist_context.local_rank], output_device=dist_context.local_rank)
+        loss_module = DDP(loss_module, **ddp_kwargs)
 
     lr = float(train_cfg.get("lr", 1.0e-5))
     weight_decay = float(train_cfg.get("weight_decay", 0.0))
@@ -958,7 +1213,7 @@ def train_sd35_vae_from_config(cfg: dict[str, Any], config_path: str | Path) -> 
         out_dir=out_dir,
         experiment_name=exp_name,
         default_project="sd35-vae-train",
-        enabled=True,
+        enabled=dist_context.is_main_process,
     )
     wandb_session.set_summary("num_classes", num_classes)
     wandb_session.set_summary("num_train_samples", len(train_ds))
@@ -973,13 +1228,15 @@ def train_sd35_vae_from_config(cfg: dict[str, Any], config_path: str | Path) -> 
     epochs = int(train_cfg.get("epochs", 10))
     global_step = 0
     step_log_interval = int((cfg.get("wandb", {}) or {}).get("log_interval_steps", 0))
-    use_pbar = bool(train_cfg.get("progress_bar", True)) and (tqdm is not None)
+    use_pbar = bool(train_cfg.get("progress_bar", True)) and (tqdm is not None) and dist_context.is_main_process
     pbar_mininterval = float(train_cfg.get("tqdm_mininterval", 0.5))
     pbar_update_interval = int(train_cfg.get("tqdm_update_interval", 10))
     pbar_leave = bool(train_cfg.get("tqdm_leave", False))
 
     try:
         for epoch in range(1, epochs + 1):
+            if train_sampler is not None and hasattr(train_sampler, "set_epoch"):
+                train_sampler.set_epoch(epoch)
             train_summary, global_step = _run_epoch(
                 vae=vae,
                 loader=train_loader,
@@ -997,7 +1254,7 @@ def train_sd35_vae_from_config(cfg: dict[str, Any], config_path: str | Path) -> 
                 noise_cfg=noise_cfg,
                 grad_accum_steps=grad_accum_steps,
                 epoch=epoch,
-                save_preview_dir=(out_dir / "previews") if bool(train_cfg.get("save_previews", True)) else None,
+                save_preview_dir=((out_dir / "previews") if (dist_context.is_main_process and bool(train_cfg.get("save_previews", True))) else None),
                 global_step_start=global_step,
                 wandb_session=wandb_session,
                 step_log_interval=step_log_interval,
@@ -1007,6 +1264,9 @@ def train_sd35_vae_from_config(cfg: dict[str, Any], config_path: str | Path) -> 
                 progress_mininterval=pbar_mininterval,
                 progress_leave=pbar_leave,
                 lpips_module=lpips_module,
+                reference_vae=reference_vae,
+                loss_module=loss_module,
+                dist_context=dist_context,
             )
             with torch.no_grad():
                 val_summary, _ = _run_epoch(
@@ -1033,151 +1293,183 @@ def train_sd35_vae_from_config(cfg: dict[str, Any], config_path: str | Path) -> 
                     progress_mininterval=pbar_mininterval,
                     progress_leave=pbar_leave,
                     lpips_module=lpips_module,
+                    reference_vae=reference_vae,
+                    loss_module=loss_module,
+                    dist_context=dist_context,
                 )
 
             history_rows.extend([train_summary.as_row(), val_summary.as_row()])
-            write_csv(history_rows, out_dir / "history.csv")
-            write_json(
-                {"train": train_summary.as_row(), "val": val_summary.as_row()},
-                out_dir / "epoch_summaries" / f"epoch_{epoch:03d}.json",
-            )
+            if dist_context.is_main_process:
+                write_csv(history_rows, out_dir / "history.csv")
+                write_json(
+                    {"train": train_summary.as_row(), "val": val_summary.as_row()},
+                    out_dir / "epoch_summaries" / f"epoch_{epoch:03d}.json",
+                )
 
-            _save_vae_checkpoint(vae, out_dir / "last" / "vae")
-            torch.save(
-                {
+                _save_vae_checkpoint(vae, out_dir / "last" / "vae")
+                torch.save(
+                    {
+                        "epoch": epoch,
+                        "global_step": global_step,
+                        "optimizer": optimizer.state_dict(),
+                        "scheduler": scheduler.state_dict() if scheduler is not None else None,
+                        "history": history_rows,
+                    },
+                    out_dir / "last" / "train_state.pt",
+                )
+
+                preview_path = out_dir / "previews" / f"epoch_{epoch:03d}.png"
+                epoch_payload = {
                     "epoch": epoch,
                     "global_step": global_step,
-                    "optimizer": optimizer.state_dict(),
-                    "scheduler": scheduler.state_dict() if scheduler is not None else None,
-                    "history": history_rows,
-                },
-                out_dir / "last" / "train_state.pt",
-            )
-
-            preview_path = out_dir / "previews" / f"epoch_{epoch:03d}.png"
-            epoch_payload = {
-                "epoch": epoch,
-                "global_step": global_step,
-                "train/loss_epoch": train_summary.total_loss,
-                "train/recon_epoch": train_summary.recon_loss,
-                "train/kl_epoch": train_summary.kl_loss,
-                "train/edge_epoch": train_summary.edge_loss,
-                "train/weighted_recon_epoch": train_summary.weighted_recon_loss,
-                "train/patch_recon_epoch": train_summary.patch_recon_loss,
-                "train/feature_epoch": train_summary.feature_loss,
-                "train/logit_epoch": train_summary.logit_loss,
-                "train/lpips_epoch": train_summary.lpips_loss,
-                "train/noise_feature_epoch": train_summary.noise_feature_loss,
-                "train/recon_term_epoch": train_summary.recon_term,
-                "train/kl_term_epoch": train_summary.kl_term,
-                "train/edge_term_epoch": train_summary.edge_term,
-                "train/weighted_recon_term_epoch": train_summary.weighted_recon_term,
-                "train/patch_recon_term_epoch": train_summary.patch_recon_term,
-                "train/feature_term_epoch": train_summary.feature_term,
-                "train/logit_term_epoch": train_summary.logit_term,
-                "train/lpips_term_epoch": train_summary.lpips_term,
-                "train/noise_feature_term_epoch": train_summary.noise_feature_term,
-                "val/loss": val_summary.total_loss,
-                "val/recon": val_summary.recon_loss,
-                "val/kl": val_summary.kl_loss,
-                "val/edge": val_summary.edge_loss,
-                "val/weighted_recon": val_summary.weighted_recon_loss,
-                "val/patch_recon": val_summary.patch_recon_loss,
-                "val/feature": val_summary.feature_loss,
-                "val/logit": val_summary.logit_loss,
-                "val/lpips": val_summary.lpips_loss,
-                "val/noise_feature": val_summary.noise_feature_loss,
-                "val/recon_term": val_summary.recon_term,
-                "val/kl_term": val_summary.kl_term,
-                "val/edge_term": val_summary.edge_term,
-                "val/weighted_recon_term": val_summary.weighted_recon_term,
-                "val/patch_recon_term": val_summary.patch_recon_term,
-                "val/feature_term": val_summary.feature_term,
-                "val/logit_term": val_summary.logit_term,
-                "val/lpips_term": val_summary.lpips_term,
-                "val/noise_feature_term": val_summary.noise_feature_term,
-                "train/lr": float(optimizer.param_groups[0]["lr"]),
-            }
-            if preview_path.is_file():
-                wb_img = maybe_build_wandb_image(wandb_session, str(preview_path), caption=f"epoch {epoch}")
-                if wb_img is not None:
-                    epoch_payload["preview/recon"] = wb_img
-            wandb_session.log(epoch_payload, step=global_step)
-            print(
-                f"[epoch {epoch}/{epochs}] "
-                f"train: total={train_summary.total_loss:.6f}, recon={train_summary.recon_loss:.6f}, "
-                f"recon_term={train_summary.recon_term:.6f}, kl={train_summary.kl_loss:.6f}, kl_term={train_summary.kl_term:.6f}, "
-                f"patch={train_summary.patch_recon_loss:.6f}, wpatch={train_summary.patch_recon_term:.6f} | "
-                f"val: total={val_summary.total_loss:.6f}, recon={val_summary.recon_loss:.6f}, "
-                f"recon_term={val_summary.recon_term:.6f}, kl={val_summary.kl_loss:.6f}, kl_term={val_summary.kl_term:.6f}, "
-                f"patch={val_summary.patch_recon_loss:.6f}, wpatch={val_summary.patch_recon_term:.6f}"
-            )
-
-            if val_summary.total_loss < best_val:
-                best_val = val_summary.total_loss
-                best_epoch = epoch
-                _save_vae_checkpoint(vae, out_dir / "best" / "vae")
-                write_json(
-                    {
-                        "best_epoch": best_epoch,
-                        "best_val_total_loss": best_val,
-                        "train_summary": train_summary.as_row(),
-                        "val_summary": val_summary.as_row(),
-                    },
-                    out_dir / "best" / "metrics.json",
+                    "train/loss_epoch": train_summary.total_loss,
+                    "train/recon_epoch": train_summary.recon_loss,
+                    "train/kl_epoch": train_summary.kl_loss,
+                    "train/edge_epoch": train_summary.edge_loss,
+                    "train/weighted_recon_epoch": train_summary.weighted_recon_loss,
+                    "train/patch_recon_epoch": train_summary.patch_recon_loss,
+                    "train/feature_epoch": train_summary.feature_loss,
+                    "train/logit_epoch": train_summary.logit_loss,
+                    "train/lpips_epoch": train_summary.lpips_loss,
+                    "train/noise_feature_epoch": train_summary.noise_feature_loss,
+                    "train/latent_distribution_epoch": train_summary.latent_distribution_loss,
+                    "train/recon_term_epoch": train_summary.recon_term,
+                    "train/kl_term_epoch": train_summary.kl_term,
+                    "train/edge_term_epoch": train_summary.edge_term,
+                    "train/weighted_recon_term_epoch": train_summary.weighted_recon_term,
+                    "train/patch_recon_term_epoch": train_summary.patch_recon_term,
+                    "train/feature_term_epoch": train_summary.feature_term,
+                    "train/logit_term_epoch": train_summary.logit_term,
+                    "train/lpips_term_epoch": train_summary.lpips_term,
+                    "train/noise_feature_term_epoch": train_summary.noise_feature_term,
+                    "train/latent_distribution_term_epoch": train_summary.latent_distribution_term,
+                    "val/loss": val_summary.total_loss,
+                    "val/recon": val_summary.recon_loss,
+                    "val/kl": val_summary.kl_loss,
+                    "val/edge": val_summary.edge_loss,
+                    "val/weighted_recon": val_summary.weighted_recon_loss,
+                    "val/patch_recon": val_summary.patch_recon_loss,
+                    "val/feature": val_summary.feature_loss,
+                    "val/logit": val_summary.logit_loss,
+                    "val/lpips": val_summary.lpips_loss,
+                    "val/noise_feature": val_summary.noise_feature_loss,
+                    "val/latent_distribution": val_summary.latent_distribution_loss,
+                    "val/recon_term": val_summary.recon_term,
+                    "val/kl_term": val_summary.kl_term,
+                    "val/edge_term": val_summary.edge_term,
+                    "val/weighted_recon_term": val_summary.weighted_recon_term,
+                    "val/patch_recon_term": val_summary.patch_recon_term,
+                    "val/feature_term": val_summary.feature_term,
+                    "val/logit_term": val_summary.logit_term,
+                    "val/lpips_term": val_summary.lpips_term,
+                    "val/noise_feature_term": val_summary.noise_feature_term,
+                    "val/latent_distribution_term": val_summary.latent_distribution_term,
+                    "train/lr": float(optimizer.param_groups[0]["lr"]),
+                }
+                if preview_path.is_file():
+                    wb_img = maybe_build_wandb_image(wandb_session, str(preview_path), caption=f"epoch {epoch}")
+                    if wb_img is not None:
+                        epoch_payload["preview/recon"] = wb_img
+                wandb_session.log(epoch_payload, step=global_step)
+                print(
+                    f"[epoch {epoch}/{epochs}] "
+                    f"train: total={train_summary.total_loss:.6f}, recon={train_summary.recon_loss:.6f}, "
+                    f"recon_term={train_summary.recon_term:.6f}, kl={train_summary.kl_loss:.6f}, kl_term={train_summary.kl_term:.6f}, "
+                    f"patch={train_summary.patch_recon_loss:.6f}, wpatch={train_summary.patch_recon_term:.6f}, "
+                    f"latent_dist={train_summary.latent_distribution_loss:.6f}, wlatent={train_summary.latent_distribution_term:.6f} | "
+                    f"val: total={val_summary.total_loss:.6f}, recon={val_summary.recon_loss:.6f}, "
+                    f"recon_term={val_summary.recon_term:.6f}, kl={val_summary.kl_loss:.6f}, kl_term={val_summary.kl_term:.6f}, "
+                    f"patch={val_summary.patch_recon_loss:.6f}, wpatch={val_summary.patch_recon_term:.6f}, "
+                    f"latent_dist={val_summary.latent_distribution_loss:.6f}, wlatent={val_summary.latent_distribution_term:.6f}"
                 )
-                wandb_session.set_summary("best_epoch", best_epoch)
-                wandb_session.set_summary("best_val_total_loss", best_val)
+
+                if val_summary.total_loss < best_val:
+                    best_val = val_summary.total_loss
+                    best_epoch = epoch
+                    _save_vae_checkpoint(vae, out_dir / "best" / "vae")
+                    write_json(
+                        {
+                            "best_epoch": best_epoch,
+                            "best_val_total_loss": best_val,
+                            "train_summary": train_summary.as_row(),
+                            "val_summary": val_summary.as_row(),
+                        },
+                        out_dir / "best" / "metrics.json",
+                    )
+                    wandb_session.set_summary("best_epoch", best_epoch)
+                    wandb_session.set_summary("best_val_total_loss", best_val)
+            else:
+                # Keep rank-local best bookkeeping in sync enough for summaries; all ranks
+                # see the same reduced validation loss.
+                if val_summary.total_loss < best_val:
+                    best_val = val_summary.total_loss
+                    best_epoch = epoch
 
             if scheduler is not None:
                 scheduler.step()
 
-        summary = {
-            "experiment_name": exp_name,
-            "num_classes": num_classes,
-            "num_train_samples": len(train_ds),
-            "num_val_samples": len(val_ds),
-            "best_epoch": best_epoch,
-            "best_val_total_loss": best_val,
-            "trainable_params": int(sum(p.numel() for p in trainable)),
-            "total_params": int(sum(p.numel() for p in vae.parameters())),
-            "global_step": global_step,
-            "posterior_train_mode": posterior_train_mode,
-            "posterior_eval_mode": posterior_eval_mode,
-        }
+        if dist_context.is_main_process:
+            summary = {
+                "experiment_name": exp_name,
+                "num_classes": num_classes,
+                "num_train_samples": len(train_ds),
+                "num_val_samples": len(val_ds),
+                "best_epoch": best_epoch,
+                "best_val_total_loss": best_val,
+                "trainable_params": int(sum(p.numel() for p in trainable)),
+                "total_params": int(sum(p.numel() for p in vae.parameters())),
+                "global_step": global_step,
+                "posterior_train_mode": posterior_train_mode,
+                "posterior_eval_mode": posterior_eval_mode,
+                "distributed": {
+                    "enabled": bool(dist_context.use_ddp),
+                    "world_size": int(dist_context.world_size),
+                },
+            }
 
-        latent_results = {}
-        latent_cfg = cfg.get("latent_stats", {}) or {}
-        if bool(latent_cfg.get("enabled", False)):
-            split = str(latent_cfg.get("split", "train")).lower()
-            loader = train_loader if split == "train" else val_loader
-            if (out_dir / "best" / "vae").is_dir():
-                latent_results["best"] = _estimate_and_save_latent_stats(
-                    cfg=cfg,
-                    source_dir=out_dir / "best" / "vae",
-                    out_dir=out_dir / "best",
-                    split_name=split,
-                    loader=loader,
-                    model_cfg=model_cfg,
-                    vae_cfg=vae_cfg,
-                    device=device,
+            latent_results = {}
+            latent_cfg = cfg.get("latent_stats", {}) or {}
+            if bool(latent_cfg.get("enabled", False)):
+                split = str(latent_cfg.get("split", "train")).lower()
+                stats_ds = train_ds if split == "train" else val_ds
+                stats_loader = DataLoader(
+                    stats_ds,
+                    batch_size=batch_size,
+                    shuffle=False,
+                    num_workers=num_workers,
+                    pin_memory=(device.type == "cuda"),
                 )
-            if bool(latent_cfg.get("also_calibrate_last", True)) and (out_dir / "last" / "vae").is_dir():
-                latent_results["last"] = _estimate_and_save_latent_stats(
-                    cfg=cfg,
-                    source_dir=out_dir / "last" / "vae",
-                    out_dir=out_dir / "last",
-                    split_name=split,
-                    loader=loader,
-                    model_cfg=model_cfg,
-                    vae_cfg=vae_cfg,
-                    device=device,
-                )
-            summary["latent_stats"] = latent_results
+                if (out_dir / "best" / "vae").is_dir():
+                    latent_results["best"] = _estimate_and_save_latent_stats(
+                        cfg=cfg,
+                        source_dir=out_dir / "best" / "vae",
+                        out_dir=out_dir / "best",
+                        split_name=split,
+                        loader=stats_loader,
+                        model_cfg=model_cfg,
+                        vae_cfg=vae_cfg,
+                        device=device,
+                    )
+                if bool(latent_cfg.get("also_calibrate_last", True)) and (out_dir / "last" / "vae").is_dir():
+                    latent_results["last"] = _estimate_and_save_latent_stats(
+                        cfg=cfg,
+                        source_dir=out_dir / "last" / "vae",
+                        out_dir=out_dir / "last",
+                        split_name=split,
+                        loader=stats_loader,
+                        model_cfg=model_cfg,
+                        vae_cfg=vae_cfg,
+                        device=device,
+                    )
+                summary["latent_stats"] = latent_results
 
-        write_json(summary, out_dir / "summary.json")
-        for key, value in summary.items():
-            wandb_session.set_summary(key, value)
+            write_json(summary, out_dir / "summary.json")
+            for key, value in summary.items():
+                wandb_session.set_summary(key, value)
+        _barrier_vae(dist_context)
         return out_dir
     finally:
-        wandb_session.finish()
+        try:
+            wandb_session.finish()
+        finally:
+            _cleanup_vae_distributed(dist_context)

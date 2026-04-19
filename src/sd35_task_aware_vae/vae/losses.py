@@ -73,6 +73,97 @@ def weighted_reconstruction_loss(
 
 
 
+
+def _latent_tokens_for_distribution(latents, max_tokens: int | None = None):
+    """Flatten latent maps to [N, C] tokens and optionally subsample tokens.
+
+    SD3.5 latents have a small channel dimension but a large spatial grid.
+    Matching covariance / Gram matrices over a random token subset keeps the
+    loss cheap while still constraining the aggregated latent distribution.
+    """
+    import torch
+
+    if latents.ndim != 4:
+        raise ValueError(f"Expected latents with shape [B, C, H, W], got {tuple(latents.shape)}")
+    tokens = latents.permute(0, 2, 3, 1).reshape(-1, latents.shape[1]).float()
+    if max_tokens is not None and int(max_tokens) > 0 and tokens.shape[0] > int(max_tokens):
+        idx = torch.randperm(tokens.shape[0], device=tokens.device)[: int(max_tokens)]
+        tokens = tokens.index_select(0, idx)
+    return tokens
+
+
+
+def latent_covariance_gram_loss(
+    latents,
+    reference_latents,
+    *,
+    kind: str = "mean_covariance",
+    max_tokens: int | None = 4096,
+    include_mean: bool | None = None,
+    mean_weight: float = 1.0,
+    matrix_weight: float = 1.0,
+    eps: float = 1.0e-6,
+):
+    """Match current latent distribution to a reference latent distribution.
+
+    ``latents`` and ``reference_latents`` are expected to be the scaled latents
+    passed to the DiT.  Supported ``kind`` values are:
+
+    - ``covariance`` / ``mean_covariance``: centered channel covariance.
+    - ``gram`` / ``mean_gram``: uncentered second-moment Gram matrix.
+    - ``correlation`` / ``mean_correlation``: normalized covariance.
+    - ``mean`` / ``mean_only``: channel mean only.
+
+    The loss compares [C, C] channel statistics of sampled latent tokens.
+    """
+    import torch
+    import torch.nn.functional as F
+
+    mode = str(kind).lower()
+    if include_mean is None:
+        include_mean = mode.startswith("mean_") or mode in {"mean", "mean_only"}
+    mode = mode.replace("mean_", "")
+
+    x = _latent_tokens_for_distribution(latents, max_tokens=max_tokens)
+    y = _latent_tokens_for_distribution(reference_latents.detach(), max_tokens=max_tokens)
+    n = min(x.shape[0], y.shape[0])
+    if n < 2:
+        return latents.new_tensor(0.0)
+    x = x[:n]
+    y = y[:n]
+
+    mu_x = x.mean(dim=0)
+    mu_y = y.mean(dim=0)
+    loss = torch.zeros((), device=latents.device, dtype=torch.float32)
+    if include_mean or mode in {"mean", "mean_only"}:
+        loss = loss + float(mean_weight) * F.mse_loss(mu_x, mu_y)
+    if mode in {"mean", "mean_only"}:
+        return loss.to(dtype=latents.dtype)
+
+    if mode in {"cov", "covariance"}:
+        xc = x - mu_x
+        yc = y - mu_y
+        mat_x = xc.transpose(0, 1).matmul(xc) / float(max(1, n - 1))
+        mat_y = yc.transpose(0, 1).matmul(yc) / float(max(1, n - 1))
+    elif mode in {"gram", "second_moment", "second-moment"}:
+        mat_x = x.transpose(0, 1).matmul(x) / float(n)
+        mat_y = y.transpose(0, 1).matmul(y) / float(n)
+    elif mode in {"corr", "correlation"}:
+        xc = x - mu_x
+        yc = y - mu_y
+        cov_x = xc.transpose(0, 1).matmul(xc) / float(max(1, n - 1))
+        cov_y = yc.transpose(0, 1).matmul(yc) / float(max(1, n - 1))
+        std_x = torch.sqrt(torch.diag(cov_x).clamp_min(float(eps)))
+        std_y = torch.sqrt(torch.diag(cov_y).clamp_min(float(eps)))
+        mat_x = cov_x / (std_x[:, None] * std_x[None, :] + float(eps))
+        mat_y = cov_y / (std_y[:, None] * std_y[None, :] + float(eps))
+    else:
+        raise ValueError(f"Unsupported latent distribution matching kind: {kind}")
+
+    loss = loss + float(matrix_weight) * F.mse_loss(mat_x, mat_y)
+    return loss.to(dtype=latents.dtype)
+
+
 def patch_reconstruction_loss(
     pred,
     target,

@@ -2,10 +2,10 @@ experiment_name: sd35m_recon_official_val
 seed: 42
 
 data:
-  root: ../data/uwf/multilabel/MedicalCheckup/splitted
-  split_filename: default_split.yaml
-  split: val
-  label_schema_file: configs/labels/proposed_schema.yaml
+  root: "../data/uwf/multilabel/MedicalCheckup/splitted"
+  split_filename: "default_split.yaml"
+  split: "val"
+  label_schema_file: "configs/labels/proposed_schema.yaml"
 
 image:
   center_crop_size: 3072
@@ -21,12 +21,12 @@ model:
 vae:
   backend: sd35
   use_official: true
-  checkpoint: null
   subfolder: vae
+  checkpoint: null
   posterior: mode
 
 inference:
-  batch_size: 2
+  batch_size: 4
   num_workers: 2
 
 noise:
@@ -38,4 +38,3 @@ output:
   copy_labels: true
   preserve_relative_paths: true
   keep_original_name_for_t0: true
-  timestep_suffix_format: "__t{t:04d}"
