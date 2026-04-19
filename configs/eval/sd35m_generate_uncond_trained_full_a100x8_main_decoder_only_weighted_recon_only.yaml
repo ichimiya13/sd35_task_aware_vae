@@ -46,7 +46,7 @@ prompt:
     faithful
 runtime:
   gpu_ids:
-  - 1
+  - 0
 seed: 42
 teacher:
   checkpoint: outputs/checkpoints/teacher/teacher_convnextl_proposed/best.pt

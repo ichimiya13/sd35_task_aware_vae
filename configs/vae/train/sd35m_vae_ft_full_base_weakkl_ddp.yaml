@@ -1,0 +1,131 @@
+data:
+  label_schema_file: configs/labels/proposed_schema.yaml
+  mean:
+  - 0.485
+  - 0.456
+  - 0.406
+  root: ../data/uwf/multilabel/MedicalCheckup/splitted
+  split_filename: default_split.yaml
+  std:
+  - 0.229
+  - 0.224
+  - 0.225
+  train_split: train
+  val_split: val
+experiment_name: sd35m_vae_ft_full_base_weakkl_ddp
+image:
+  center_crop_size: 3072
+  image_size: 1024
+latent_stats:
+  also_calibrate_last: true
+  enabled: true
+  max_batches: 128
+  overwrite_saved_dir: false
+  posterior: mode
+  split: train
+  update_config: true
+loss:
+  recon:
+    weight: 1.0
+    type: l1
+    epsilon: 0.001
+  kl:
+    weight: 2.0e-07
+  edge:
+    weight: 0.0
+    type: sobel_l1
+    use_weight_map: false
+  weighted_recon:
+    weight: 0.0
+    type: l1
+    epsilon: 0.001
+  patch_recon:
+    weight: 0.0
+    type: l1
+    epsilon: 0.001
+    crop_ratio: 0.5
+    center_x: 0.5
+    center_y: 0.5
+  weight_map:
+    mode: center_gaussian
+    min_weight: 1.0
+    max_weight: 3.0
+    gamma: 1.0
+    apply_retina_mask: true
+    retina_threshold: 0.03
+    center_x: 0.5
+    center_y: 0.5
+    sigma: 0.22
+  feature:
+    weight: 0.0
+    type: mse
+  logit:
+    weight: 0.0
+    type: smooth_l1
+  lpips:
+    weight: 0.0
+    net: alex
+  noise_feature:
+    weight: 0.0
+    type: mse
+model:
+  allow_tf32: true
+  device: cuda
+  family: sd35
+  repo_id: stabilityai/stable-diffusion-3.5-medium
+  torch_dtype: bf16
+  variant: medium
+noise_conditioning:
+  max_beta: 0.25
+  min_beta: 0.02
+  mode: gaussian
+output:
+  root_dir: outputs/checkpoints/vae
+runtime:
+  gpu_ids:
+  - 0
+  - 1
+  - 2
+  - 3
+  - 4
+  - 5
+  - 6
+  - 7
+distributed:
+  enabled: true
+  backend: nccl
+  timeout_seconds: 7200
+  find_unused_parameters: false
+  broadcast_buffers: false
+seed: 42
+teacher:
+  checkpoint: outputs/checkpoints/teacher/teacher_convnextl_proposed/best.pt
+  feature_stage: embedding
+  imagenet_pretrained: true
+train:
+  batch_size: 1
+  drop_last: true
+  epochs: 10
+  grad_accum_steps: 1
+  lr: 1.0e-05
+  lr_scheduler: cosine
+  num_workers: 4
+  optimizer: adamw
+  save_previews: true
+  weight_decay: 0.0
+vae:
+  backend: sd35
+  checkpoint: null
+  freeze_patterns: []
+  posterior:
+    eval: mode
+    train: mode
+  subfolder: vae
+  unfreeze_patterns: []
+  use_official: true
+wandb:
+  enabled: true
+  log_interval_steps: 10
+  mode: online
+  name: sd35m_vae_ft_full_base_weakkl_ddp
+  project: uwf-sd35
