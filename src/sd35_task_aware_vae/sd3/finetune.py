@@ -403,53 +403,114 @@ def _compute_loss_weighting_fallback(weighting_scheme: str, sigmas: torch.Tensor
 
 
 
-"""
-def _ensure_scheduler_state(noise_scheduler, device: torch.device) -> None:
-    if getattr(noise_scheduler, "timesteps", None) is not None and getattr(noise_scheduler, "sigmas", None) is not None:
-        return
-    num_train_timesteps = int(getattr(noise_scheduler.config, "num_train_timesteps", 1000))
+
+
+def _resolve_training_num_timesteps(noise_scheduler, diffusion_cfg: dict[str, Any] | None = None) -> int:
+    """Return the number of scheduler timesteps to use for training.
+
+    Diffusers pipelines call scheduler.set_timesteps(num_inference_steps) during
+    preview/inference, which shrinks scheduler.timesteps to e.g. 40 values. For
+    SD3 training we need the full training schedule, usually 1000 values.
+    """
+    diffusion_cfg = diffusion_cfg or {}
+    explicit = diffusion_cfg.get("num_train_timesteps", diffusion_cfg.get("training_num_timesteps", None))
+    if explicit is not None:
+        return int(explicit)
+    return int(getattr(noise_scheduler.config, "num_train_timesteps", 1000))
+
+
+def _set_scheduler_timesteps(noise_scheduler, num_timesteps: int, device: torch.device) -> None:
     try:
-        noise_scheduler.set_timesteps(num_train_timesteps, device=device)
+        noise_scheduler.set_timesteps(int(num_timesteps), device=device)
     except TypeError:
-        noise_scheduler.set_timesteps(num_train_timesteps)
-"""
+        noise_scheduler.set_timesteps(int(num_timesteps))
+    for attr in ("timesteps", "sigmas"):
+        value = getattr(noise_scheduler, attr, None)
+        if value is not None:
+            try:
+                setattr(noise_scheduler, attr, value.to(device))
+            except Exception:
+                pass
 
-def _ensure_scheduler_state(noise_scheduler, device: torch.device) -> None:
-    has_t = getattr(noise_scheduler, "timesteps", None) is not None
-    has_s = getattr(noise_scheduler, "sigmas", None) is not None
 
-    if has_t and has_s:
+def _ensure_scheduler_state(
+    noise_scheduler,
+    device: torch.device,
+    *,
+    expected_num_timesteps: int | None = None,
+    force_reset: bool = False,
+) -> None:
+    """Ensure scheduler tensors are on device and, for training, full length.
+
+    This intentionally resets the scheduler when expected_num_timesteps is
+    provided and the current state has a different number of timesteps. Without
+    this guard, text2img previews can leave the shared pipeline scheduler in a
+    40-step inference state, after which timestep sampling silently collapses.
+    """
+    timesteps = getattr(noise_scheduler, "timesteps", None)
+    sigmas = getattr(noise_scheduler, "sigmas", None)
+    has_state = timesteps is not None and sigmas is not None
+
+    needs_reset = bool(force_reset) or not has_state
+    if expected_num_timesteps is not None and has_state:
         try:
-            noise_scheduler.timesteps = noise_scheduler.timesteps.to(device)
-            noise_scheduler.sigmas = noise_scheduler.sigmas.to(device)
+            needs_reset = needs_reset or (int(len(timesteps)) != int(expected_num_timesteps))
         except Exception:
-            pass
+            needs_reset = True
+
+    if needs_reset:
+        num_steps = int(expected_num_timesteps) if expected_num_timesteps is not None else _resolve_training_num_timesteps(noise_scheduler)
+        _set_scheduler_timesteps(noise_scheduler, num_steps, device)
         return
 
-    num_train_timesteps = int(getattr(noise_scheduler.config, "num_train_timesteps", 1000))
-    try:
-        noise_scheduler.set_timesteps(num_train_timesteps, device=device)
-    except TypeError:
-        noise_scheduler.set_timesteps(num_train_timesteps)
-        if getattr(noise_scheduler, "timesteps", None) is not None:
-            noise_scheduler.timesteps = noise_scheduler.timesteps.to(device)
-        if getattr(noise_scheduler, "sigmas", None) is not None:
-            noise_scheduler.sigmas = noise_scheduler.sigmas.to(device)
+    for attr in ("timesteps", "sigmas"):
+        value = getattr(noise_scheduler, attr, None)
+        if value is not None:
+            try:
+                setattr(noise_scheduler, attr, value.to(device))
+            except Exception:
+                pass
 
 
-def _get_sigmas(noise_scheduler, timesteps: torch.Tensor, n_dim: int = 4, dtype=torch.float32, device: torch.device | None = None):
+def _build_training_scheduler(pipe_scheduler, device: torch.device, diffusion_cfg: dict[str, Any]):
+    """Create a scheduler dedicated to training.
+
+    The pipeline scheduler is mutable during inference. Keeping a separate
+    scheduler avoids preview/inference calls contaminating training timesteps.
+    """
+    scheduler = copy.deepcopy(pipe_scheduler)
+    expected = _resolve_training_num_timesteps(scheduler, diffusion_cfg)
+    _ensure_scheduler_state(scheduler, device, expected_num_timesteps=expected, force_reset=True)
+    return scheduler
+
+
+def _get_sigmas(
+    noise_scheduler,
+    timesteps: torch.Tensor,
+    n_dim: int = 4,
+    dtype=torch.float32,
+    device: torch.device | None = None,
+    expected_num_timesteps: int | None = None,
+):
     if device is None:
         device = timesteps.device
-    _ensure_scheduler_state(noise_scheduler, device)
+    _ensure_scheduler_state(noise_scheduler, device, expected_num_timesteps=expected_num_timesteps)
     sigmas = noise_scheduler.sigmas.to(device=device, dtype=dtype)
     schedule_timesteps = noise_scheduler.timesteps.to(device)
     timesteps = timesteps.to(device)
-    step_indices = [(schedule_timesteps == t).nonzero().item() for t in timesteps]
+
+    step_indices: list[int] = []
+    for t in timesteps:
+        matches = (schedule_timesteps == t).nonzero(as_tuple=False).flatten()
+        if matches.numel() == 0:
+            idx = torch.argmin(torch.abs(schedule_timesteps.float() - t.float())).item()
+        else:
+            idx = int(matches[0].item())
+        step_indices.append(idx)
     sigma = sigmas[step_indices].flatten()
     while len(sigma.shape) < n_dim:
         sigma = sigma.unsqueeze(-1)
     return sigma
-
 
 
 def _sample_training_timesteps(noise_scheduler, batch_size: int, device: torch.device, diffusion_cfg: dict[str, Any]) -> torch.Tensor:
@@ -477,11 +538,20 @@ def _sample_training_timesteps(noise_scheduler, batch_size: int, device: torch.d
             mode_scale=mode_scale,
         )
 
-    _ensure_scheduler_state(noise_scheduler, device)
-    num_train_timesteps = int(getattr(noise_scheduler.config, "num_train_timesteps", len(noise_scheduler.timesteps)))
-    indices = (u * num_train_timesteps).long().clamp_(0, len(noise_scheduler.timesteps) - 1)
-    return noise_scheduler.timesteps[indices].to(device=device)
+    expected_num_timesteps = _resolve_training_num_timesteps(noise_scheduler, diffusion_cfg)
+    _ensure_scheduler_state(noise_scheduler, device, expected_num_timesteps=expected_num_timesteps)
+    schedule_timesteps = noise_scheduler.timesteps.to(device)
+    schedule_len = int(len(schedule_timesteps))
+    if schedule_len <= 0:
+        raise RuntimeError("Training scheduler has no timesteps after set_timesteps().")
+    if schedule_len != int(expected_num_timesteps):
+        raise RuntimeError(
+            f"Training scheduler state mismatch: expected {expected_num_timesteps} timesteps, got {schedule_len}. "
+            "This usually means inference preview mutated the scheduler."
+        )
 
+    indices = (u * schedule_len).long().clamp_(0, schedule_len - 1)
+    return schedule_timesteps[indices].to(device=device)
 
 
 def _compute_sd3_loss_weighting(diffusion_cfg: dict[str, Any], sigmas: torch.Tensor) -> torch.Tensor:
@@ -559,7 +629,11 @@ def _maybe_generate_text2img_preview(pipe, preview_cfg: dict[str, Any], out_path
     if seed is not None:
         generator = torch.Generator(device=pipe._execution_device if hasattr(pipe, "_execution_device") else None).manual_seed(int(seed))
 
+    original_scheduler = getattr(pipe, "scheduler", None)
+    preview_scheduler = copy.deepcopy(original_scheduler) if original_scheduler is not None else None
     try:
+        if preview_scheduler is not None:
+            pipe.scheduler = preview_scheduler
         with torch.no_grad():
             image = pipe(
                 prompt=prompt,
@@ -574,6 +648,9 @@ def _maybe_generate_text2img_preview(pipe, preview_cfg: dict[str, Any], out_path
     except Exception as e:
         print(f"[warn] preview generation failed: {e}", flush=True)
         return None
+    finally:
+        if original_scheduler is not None:
+            pipe.scheduler = original_scheduler
 
 
 
@@ -685,7 +762,15 @@ def _compute_diffusion_terms(
         device=latents.device,
         diffusion_cfg=diffusion_cfg,
     )
-    sigmas = _get_sigmas(noise_scheduler, timesteps, n_dim=latents.ndim, dtype=latents.dtype, device=latents.device)
+    expected_num_timesteps = _resolve_training_num_timesteps(noise_scheduler, diffusion_cfg)
+    sigmas = _get_sigmas(
+        noise_scheduler,
+        timesteps,
+        n_dim=latents.ndim,
+        dtype=latents.dtype,
+        device=latents.device,
+        expected_num_timesteps=expected_num_timesteps,
+    )
     noisy_model_input = (1.0 - sigmas) * latents + sigmas * noise
 
     model_pred = transformer(
@@ -712,6 +797,11 @@ def _compute_diffusion_terms(
         "loss": diff_loss,
         "mean_timestep": float(timesteps.float().mean().detach().cpu()),
         "mean_sigma": float(sigmas.float().mean().detach().cpu()),
+        "min_timestep": float(timesteps.float().min().detach().cpu()),
+        "max_timestep": float(timesteps.float().max().detach().cpu()),
+        "min_sigma": float(sigmas.float().min().detach().cpu()),
+        "max_sigma": float(sigmas.float().max().detach().cpu()),
+        "scheduler_num_timesteps": int(len(noise_scheduler.timesteps)),
     }
 
 
@@ -809,6 +899,7 @@ def _cleanup_distributed(context: DistributedContext | None) -> None:
 def _run_epoch(
     *,
     pipe,
+    training_scheduler,
     transformer,
     vae,
     teacher,
@@ -915,7 +1006,7 @@ def _run_epoch(
                             transformer=transformer,
                             prompt_batch=prompt_batch,
                             latents=latents,
-                            noise_scheduler=pipe.scheduler,
+                            noise_scheduler=training_scheduler,
                             diffusion_cfg=diffusion_cfg,
                         )
                         terms_total = terms_total + objective_diffusion_weight * diffusion_terms["loss"]
@@ -996,6 +1087,11 @@ def _run_epoch(
                     payload["train/diffusion_step"] = float(diffusion_terms["loss"].detach().cpu())
                     payload["train/mean_timestep"] = float(diffusion_terms["mean_timestep"])
                     payload["train/mean_sigma"] = float(diffusion_terms["mean_sigma"])
+                    payload["train/min_timestep"] = float(diffusion_terms.get("min_timestep", diffusion_terms["mean_timestep"]))
+                    payload["train/max_timestep"] = float(diffusion_terms.get("max_timestep", diffusion_terms["mean_timestep"]))
+                    payload["train/min_sigma"] = float(diffusion_terms.get("min_sigma", diffusion_terms["mean_sigma"]))
+                    payload["train/max_sigma"] = float(diffusion_terms.get("max_sigma", diffusion_terms["mean_sigma"]))
+                    payload["train/scheduler_num_timesteps"] = int(diffusion_terms.get("scheduler_num_timesteps", -1))
                 if vae_terms is not None:
                     payload.update(
                         {
@@ -1210,8 +1306,11 @@ def train_sd35_system_from_config(cfg: dict[str, Any], config_path: str | Path) 
         if transformer is None or vae is None:
             raise RuntimeError("Failed to initialize SD3 pipeline components.")
 
+        # Keep training and preview/inference scheduler states separate.
+        # Diffusers preview calls mutate pipe.scheduler.timesteps to num_inference_steps,
+        # whereas training must sample from the full training schedule.
         pipe.scheduler = copy.deepcopy(pipe.scheduler)
-        _ensure_scheduler_state(pipe.scheduler, device)
+        training_scheduler = _build_training_scheduler(pipe.scheduler, device, diffusion_cfg)
 
         if bool(train_cfg.get("gradient_checkpointing", False)) and hasattr(transformer, "enable_gradient_checkpointing"):
             transformer.enable_gradient_checkpointing()
@@ -1411,6 +1510,7 @@ def train_sd35_system_from_config(cfg: dict[str, Any], config_path: str | Path) 
 
             train_metrics, global_step = _run_epoch(
                 pipe=pipe,
+                training_scheduler=training_scheduler,
                 transformer=transformer_train_module,
                 vae=vae,
                 teacher=teacher,
@@ -1454,6 +1554,7 @@ def train_sd35_system_from_config(cfg: dict[str, Any], config_path: str | Path) 
             with torch.no_grad():
                 val_metrics, _ = _run_epoch(
                     pipe=pipe,
+                    training_scheduler=training_scheduler,
                     transformer=transformer_train_module,
                     vae=vae,
                     teacher=teacher,
