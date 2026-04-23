@@ -12,7 +12,7 @@ data:
   - 0.225
   train_split: train
   val_split: val
-experiment_name: sd35m_vae_ft_full_center_patch_only_weakkl_ddp
+experiment_name: sd35m_vae_ft_full_center_patch_only_weakkl_ddp_kl3e-10
 image:
   center_crop_size: 3072
   image_size: 1024
@@ -30,7 +30,7 @@ loss:
     type: l1
     epsilon: 0.001
   kl:
-    weight: 2.0e-07
+    weight: 3.0e-10
   edge:
     weight: 0.0
     type: sobel_l1
@@ -103,13 +103,13 @@ teacher:
   feature_stage: embedding
   imagenet_pretrained: true
 train:
-  batch_size: 1
+  batch_size: 2
   drop_last: true
   epochs: 10
-  grad_accum_steps: 1
+  grad_accum_steps: 4
   lr: 1.0e-05
   lr_scheduler: cosine
-  num_workers: 4
+  num_workers: 16
   optimizer: adamw
   save_previews: true
   weight_decay: 0.0
@@ -127,5 +127,5 @@ wandb:
   enabled: true
   log_interval_steps: 10
   mode: online
-  name: sd35m_vae_ft_full_center_patch_only_weakkl_ddp
+  name: sd35m_vae_ft_full_center_patch_only_weakkl_ddp_kl3e-10
   project: uwf-sd35
